@@ -138,6 +138,21 @@ rootfs/userdata.img        # 由 userdata.img.zst 解压而来
 
 `boot_a.img` 里是 GPL 内核二进制；如果分发它，请同时提供对应的内核源码与 config。
 
+## 内核来源与许可
+
+镜像里的内核不是联想原厂镜像，而是：
+
+- **上游**：[smith-dog/kernel-tb371fc](https://github.com/smith-dog/kernel-tb371fc)
+  提交 `2c25a63a541d`（GPL-2.0，基于联想 GPL 源码）
+- **补丁**：[docs/kernel/tb371fc-4.19-linux.patch](docs/kernel/tb371fc-4.19-linux.patch)
+  （61 个文件，含 4 个新增源文件）
+- **配置**：[docs/kernel/tb371fc-4.19.325.config](docs/kernel/tb371fc-4.19.325.config)
+
+三样合起来就是 Release 里 `boot_a.img` 内核的完整对应源码，`dtbo_a.img`
+来自同一棵树。重建步骤和逐字节校验见 [docs/kernel.md](docs/kernel.md)。
+
+镜像内的其余第三方组件（Arch 软件包、`kona-ctl` 等）及各自许可证见 [NOTICE](NOTICE)。
+
 ## 免责声明
 
 - 这台机器**没有 EDL 退路**（`fastboot oem edl` 返回 unknown），写错 GPT 基本等于变砖
