@@ -3,8 +3,9 @@
 在 Lenovo TB371FC（高通 kona / SM8250，8 GB RAM，2944×1840 NT36532 双 DSI 屏）上跑
 **Arch Linux ARM aarch64 + KDE Plasma 6 Wayland** 的补丁集合。
 
-> 跑在原生 vendor **4.19.325-perf++** 内核上。这台机器官方只提供 Android，
-> Linux 侧的坑基本都要自己填。
+> 跑在 **4.19.325** 内核上，来自 [smith-dog/kernel-tb371fc](https://github.com/smith-dog/kernel-tb371fc)
+> （GPL-2.0，基于联想 GPL 源码），构建配置见 [docs/kernel.md](docs/kernel.md)。
+> 这台机器官方只提供 Android，Linux 侧的坑基本都要自己填。
 >
 > 本仓库只放**补丁、配置、自写源码和踩坑记录**，不含系统镜像。
 > 2026-11 存档：作者已停止开发，未完成的部分见 [docs/known-issues.md](docs/known-issues.md)。
@@ -68,6 +69,7 @@ pgrep -a Xwayland                  # 期望有进程
 | [ufs-flashing-constraints.md](docs/ufs-flashing-constraints.md) | 写盘前必读：分区、`-S 16M`、LBA1、无 EDL |
 | [ime-cjk-limitations.md](docs/ime-cjk-limitations.md) | Chromium/Electron 为什么打不了中文 |
 | [system-services.md](docs/system-services.md) | 触控重绑、音频初始化、充电上限、zram、电源键、udev 等小服务 |
+| [kernel.md](docs/kernel.md) | 内核来源（smith-dog 树）、构建配置、GPL 合规说明 |
 | [known-issues.md](docs/known-issues.md) | 已知硬伤与未完成项 |
 | [image-packaging.md](docs/image-packaging.md) | 热抓 rootfs → sparse → 可刷镜像的完整流程 |
 
@@ -102,6 +104,9 @@ scripts/
   apply-all.sh      安装以上全部补丁
   flash-linux.sh / flash-windows.bat   刷写脚本（配合自行准备的镜像使用）
 docs/
+  kernel.md         内核来源、构建配置、GPL 合规
+  kernel/           从镜像里提取的内核 .config
+NOTICE              第三方组件与许可声明
 ```
 
 ## 镜像去哪了
@@ -118,7 +123,9 @@ cat TB371FC-ArchLinux-image.zip.001 TB371FC-ArchLinux-image.zip.002 > TB371FC-Ar
 sha256sum -c SHA256SUMS.txt
 ```
 
-镜像里包含 Arch 各软件包和厂商 4.19 内核，按原样提供，再分发前请自行确认许可证问题。
+镜像里的内核与 dtbo 按 **GPL-2.0** 分发，来源、构建配置和对应源码见
+[docs/kernel.md](docs/kernel.md) 与 [NOTICE](NOTICE)；rootfs 里的 Arch 软件包各自
+保留自己的许可证（文本在镜像的 `/usr/share/licenses/` 下）。
 自己从跑着的系统打包的完整流程在 [image-packaging.md](docs/image-packaging.md)。
 `scripts/flash-*.sh` 按下面的目录布局工作：
 
@@ -138,4 +145,5 @@ rootfs/userdata.img        # 由 userdata.img.zst 解压而来
 
 ## License
 
-代码 MIT；`docs/` 下文档 CC BY-SA 4.0。见 [LICENSE](LICENSE)。
+代码 MIT；`docs/` 下文档 CC BY-SA 4.0（见 [LICENSE](LICENSE)）。
+镜像内的内核、设备树和 Arch 软件包遵循各自的上游许可，汇总见 [NOTICE](NOTICE)。

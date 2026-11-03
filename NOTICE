@@ -1,0 +1,34 @@
+TB371FC-ArchLinux — third-party components
+
+1. Linux kernel and device tree
+   Files: boot_a.img, dtbo_a.img (inside the release image)
+   License: GPL-2.0 WITH Linux-syscall-note
+   Source:  https://github.com/smith-dog/kernel-tb371fc  (4.19.325 bring-up tree)
+            based on Lenovo's GPL release for TB371FC and
+            https://github.com/lss4/android_kernel_lenovo_paladin
+   The boot image is a repack: vendor-style 4.19.325 kernel, our own initramfs
+   and Linux cmdline. Build configuration is published at
+   docs/kernel/tb371fc-4.19.325.config; the license text is COPYING in the
+   upstream tree.
+   Written offer: if you need the source corresponding to this binary and it is
+   not covered by the upstream repository, open an issue at
+   https://github.com/jiimjiim/TB371FC-ArchLinux/issues and we will provide it.
+
+2. Arch Linux ARM root filesystem (userdata.img.zst)
+   Contains packages under their own licenses. License texts are kept inside the
+   image under /usr/share/licenses/. This repository adds no restrictions on top
+   of those licenses.
+
+3. kona-ctl (prebuilt/kona-ctl)
+   Prebuilt aarch64 ALSA control tool, used by kona-audio-init. Source is not
+   available and its license is unknown. If you need a clean set, remove it and
+   replace the kona-audio-init calls with amixer equivalents
+   (see docs/system-services.md).
+
+4. Qt 6.12 and Mesa/Turnip
+   tools/qt-patch.py and tools/tb371fc-turnip-kgsl-patch only contain byte offsets
+   and patch logic. No Qt or Mesa binaries are redistributed by this repository.
+
+5. Everything else in this repository
+   Code: MIT (see LICENSE).
+   Documentation under docs/: CC BY-SA 4.0.
