@@ -1,0 +1,11 @@
+[Unit]
+Description=Reinit Novatek touch controller after display power-on
+After=systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/tb371fc-touch-rebind.sh
+
+[Install]
+WantedBy=multi-user.target

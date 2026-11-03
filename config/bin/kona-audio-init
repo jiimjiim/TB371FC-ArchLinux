@@ -1,0 +1,16 @@
+#!/bin/sh
+# Wait for the kona sound card (registered only after ADSP boot).
+i=0
+while [ $i -lt 600 ]; do
+    [ -e /dev/snd/controlC0 ] && break
+    sleep 0.2
+    i=$((i + 1))
+done
+[ -e /dev/snd/controlC0 ] || exit 1
+sleep 1
+CTL=/usr/local/bin/kona-ctl
+$CTL set "PRI_TDM_RX_0 SampleRate" 3
+$CTL set "PRI_TDM_RX_0 Format" 2
+$CTL set "PRI_TDM_RX_0 Channels" 3
+$CTL set "PRI_TDM_RX_0 Audio Mixer MultiMedia1" 1
+$CTL set "TFA9894_CHAN_SELECTOR" 1

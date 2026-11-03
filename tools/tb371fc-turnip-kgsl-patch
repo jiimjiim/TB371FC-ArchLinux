@@ -1,0 +1,18 @@
+#!/bin/sh
+# Mesa's KGSL backend refuses the whole device when VK_KHR_display is enabled.
+# Turn the tbz guard at 0x125354 into an unconditional branch.
+# Layout checked against: mesa 25.0~git2501270600.dea4b4~oibaf-turnip-kgsl~n arm64.
+f=/usr/lib/libvulkan_freedreno.so
+[ -f "$f" ] || exit 0
+cur=$(dd if="$f" bs=1 skip=$((0x125354)) count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
+if [ "$cur" = "14000014" ]; then
+    echo "already patched"
+    exit 0
+fi
+if [ "$cur" != "98020036" ]; then
+    echo "unexpected bytes at 0x125354: $cur (mesa changed?)" >&2
+    exit 1
+fi
+[ -f "$f.ppa-orig" ] || cp -a "$f" "$f.ppa-orig"
+printf '\x14\x00\x00\x14' | dd of="$f" bs=1 seek=$((0x125354)) conv=notrunc 2>/dev/null
+echo patched

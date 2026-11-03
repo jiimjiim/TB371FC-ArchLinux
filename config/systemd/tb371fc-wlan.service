@@ -1,0 +1,12 @@
+[Unit]
+Description=Load QCA6390 WLAN driver
+After=qrtr-ns.service
+Requires=qrtr-ns.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/modprobe wlan
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

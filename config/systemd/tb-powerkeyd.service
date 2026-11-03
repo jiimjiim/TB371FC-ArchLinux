@@ -1,0 +1,11 @@
+[Unit]
+Description=TB371FC power key screen on/off (backlight)
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/local/bin/tb-powerkeyd
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

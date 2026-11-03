@@ -1,0 +1,12 @@
+#!/bin/sh
+ibus_file=$(ls -t "$HOME"/.config/ibus/bus/* 2>/dev/null | head -1)
+if [ -n "$ibus_file" ]; then
+    addr=$(grep -m1 '^IBUS_ADDRESS=' "$ibus_file" | cut -d= -f2-)
+    [ -n "$addr" ] && export IBUS_ADDRESS="$addr"
+fi
+if [ -n "$WAYLAND_DISPLAY" ]; then
+    exec /opt/Qoder-CN/qoder-cn --ozone-platform=wayland "$@"
+fi
+scale=$(grep -m1 '"scale"' "$HOME/.config/kwinoutputconfig.json" 2>/dev/null | tr -dc '0-9.')
+[ -n "$scale" ] || scale=1
+exec /opt/Qoder-CN/qoder-cn --ozone-platform=x11 --force-device-scale-factor="$scale" "$@"

@@ -1,0 +1,14 @@
+[Unit]
+Description=Boot ADSP early for audio stack
+DefaultDependencies=no
+After=local-fs.target
+Before=sound.target
+ConditionPathExists=/sys/kernel/boot_adsp/boot
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/sh -c 'echo 1 > /sys/kernel/boot_adsp/boot'
+
+[Install]
+WantedBy=multi-user.target

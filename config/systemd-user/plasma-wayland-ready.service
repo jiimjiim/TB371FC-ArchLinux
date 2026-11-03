@@ -1,0 +1,9 @@
+[Unit]
+Description=Wait for KWin Wayland socket
+After=plasma-kwin_wayland.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/wait-wayland-socket.sh
+TimeoutStartSec=20

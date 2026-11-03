@@ -1,0 +1,13 @@
+[Unit]
+StartLimitIntervalSec=0
+Description=TB371FC battery charge limit
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/tb371fc-chglimit.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Kona TDM/TFA audio defaults
+After=sound.target
+Wants=sound.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kona-audio-init
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

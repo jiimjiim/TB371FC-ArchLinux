@@ -1,0 +1,17 @@
+# disk images / archives (distributed via Releases, never committed)
+*.img
+*.img.zst
+*.simg
+*.zst
+*.7z
+*.zip
+
+# build output
+build/
+*.o
+*.so.orig
+*.so.bak
+__pycache__/
+
+# local leftovers
+*.log
