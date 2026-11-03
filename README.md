@@ -106,9 +106,19 @@ docs/
 
 ## 镜像去哪了
 
-`rootfs` 是约 3.15 GB 的 zst，超过 GitHub 单文件/单资产限制，而且包含 Arch 各软件包
-和厂商内核 —— 再分发有许可证和隐私问题，所以**不随仓库发布**。
+可刷整合包在 [Releases](https://github.com/jiimjiim/TB371FC-ArchLinux/releases) 里。
+GitHub 单资产上限 2 GB，所以 zip 切成了两卷，下载后先合并：
 
+```bash
+# Windows
+copy /b TB371FC-ArchLinux-image.zip.001+TB371FC-ArchLinux-image.zip.002 TB371FC-ArchLinux-image.zip
+# Linux / macOS
+cat TB371FC-ArchLinux-image.zip.001 TB371FC-ArchLinux-image.zip.002 > TB371FC-ArchLinux-image.zip
+
+sha256sum -c SHA256SUMS.txt
+```
+
+镜像里包含 Arch 各软件包和厂商 4.19 内核，按原样提供，再分发前请自行确认许可证问题。
 自己从跑着的系统打包的完整流程在 [image-packaging.md](docs/image-packaging.md)。
 `scripts/flash-*.sh` 按下面的目录布局工作：
 
