@@ -3,6 +3,7 @@
 *.py  text eol=lf
 *.bat text eol=crlf
 *.cmd text eol=crlf
+*.patch -text
 prebuilt/kona-ctl binary
 *.png binary
 *.so  binary
