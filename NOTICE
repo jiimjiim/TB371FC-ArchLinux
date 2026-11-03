@@ -3,16 +3,18 @@ TB371FC-ArchLinux — third-party components
 1. Linux kernel and device tree
    Files: boot_a.img, dtbo_a.img (inside the release image)
    License: GPL-2.0 WITH Linux-syscall-note
-   Source:  https://github.com/smith-dog/kernel-tb371fc  (4.19.325 bring-up tree)
-            based on Lenovo's GPL release for TB371FC and
-            https://github.com/lss4/android_kernel_lenovo_paladin
-   The boot image is a repack: vendor-style 4.19.325 kernel, our own initramfs
-   and Linux cmdline. Build configuration is published at
-   docs/kernel/tb371fc-4.19.325.config; the license text is COPYING in the
-   upstream tree.
-   Written offer: if you need the source corresponding to this binary and it is
-   not covered by the upstream repository, open an issue at
-   https://github.com/jiimjiim/TB371FC-ArchLinux/issues and we will provide it.
+   Source:  https://github.com/smith-dog/kernel-tb371fc
+            commit 2c25a63a541dc6b98cf25212fbac7d2a4c687351
+            plus docs/kernel/tb371fc-4.19-linux.patch
+            and docs/kernel/tb371fc-4.19.325.config
+            The upstream tree is derived from Lenovo's GPL release for TB371FC
+            and https://github.com/lss4/android_kernel_lenovo_paladin
+   The boot image is a repack: 4.19.325 kernel, our own initramfs and Linux
+   cmdline. The three items above are the complete corresponding source;
+   see docs/kernel.md for the byte-exact verification. License text: COPYING
+   in the upstream tree.
+   If a rebuild does not match the shipped binary, open an issue at
+   https://github.com/jiimjiim/TB371FC-ArchLinux/issues.
 
 2. Arch Linux ARM root filesystem (userdata.img.zst)
    Contains packages under their own licenses. License texts are kept inside the

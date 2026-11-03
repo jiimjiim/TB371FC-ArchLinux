@@ -1,0 +1,2766 @@
+diff --git a/arch/arm64/kernel/cpu-reset.h b/arch/arm64/kernel/cpu-reset.h
+index f300e7577..4121ecd24 100644
+--- a/arch/arm64/kernel/cpu-reset.h
++++ b/arch/arm64/kernel/cpu-reset.h
+@@ -16,15 +16,14 @@
+ void __cpu_soft_restart(unsigned long el2_switch, unsigned long entry,
+ 	unsigned long arg0, unsigned long arg1, unsigned long arg2);
+ 
+-static inline void __noreturn cpu_soft_restart(unsigned long entry,
++static inline void __noreturn kexec_cpu_soft_restart(unsigned long entry,
+ 					       unsigned long arg0,
+ 					       unsigned long arg1,
+ 					       unsigned long arg2)
+ {
+ 	typeof(__cpu_soft_restart) *restart;
+ 
+-	unsigned long el2_switch = !is_kernel_in_hyp_mode() &&
+-		is_hyp_mode_available();
++	unsigned long el2_switch = 0; /* TB371FC: stay at EL1; HVC path hangs */
+ 	restart = (void *)__pa_function(__cpu_soft_restart);
+ 
+ 	cpu_install_idmap();
+diff --git a/arch/arm64/kernel/machine_kexec.c b/arch/arm64/kernel/machine_kexec.c
+index 5e26ef007..26ef14d81 100644
+--- a/arch/arm64/kernel/machine_kexec.c
++++ b/arch/arm64/kernel/machine_kexec.c
+@@ -215,7 +215,30 @@ void machine_kexec(struct kimage *kimage)
+ 	 * relocation is complete.
+ 	 */
+ 
+-	cpu_soft_restart(reboot_code_buffer_phys, kimage->head, kimage->start, 0);
++	{
++		phys_addr_t dtb = 0;
++		unsigned long kentry = kimage->start;
++		unsigned long si;
++
++		for (si = 0; si < kimage->nr_segments; si++) {
++			void *sp = phys_to_virt(kimage->segment[si].mem);
++			unsigned long sz = kimage->segment[si].memsz;
++
++			if (sz >= 0x40 &&
++			    (*(const u32 *)((char *)sp + 0x38) == 0x644d5241)) {
++				kentry = kimage->segment[si].mem;
++				pr_info("tb371fc: kexec image entry=%pa sz=%lx\n",
++					&kentry, sz);
++			}
++			if (sz >= 8 && !dtb &&
++			    (*(const u32 *)sp == 0xedfe0dd0))
++				dtb = kimage->segment[si].mem;
++		}
++		pr_info("tb371fc: kexec dtb=%pa start=%pa entry=%pa\n",
++			&dtb, &kimage->start, &kentry);
++		kexec_cpu_soft_restart(reboot_code_buffer_phys, kimage->head,
++				       kentry, dtb);
++	}
+ 
+ 	BUG(); /* Should never get here. */
+ }
+diff --git a/arch/arm64/kernel/relocate_kernel.S b/arch/arm64/kernel/relocate_kernel.S
+index f407e422a..282937263 100644
+--- a/arch/arm64/kernel/relocate_kernel.S
++++ b/arch/arm64/kernel/relocate_kernel.S
+@@ -34,6 +34,7 @@ ENTRY(arm64_relocate_new_kernel)
+ 	/* Setup the list loop variables. */
+ 	mov	x17, x1				/* x17 = kimage_start */
+ 	mov	x16, x0				/* x16 = kimage_head */
++	mov	x18, x2				/* x18 = dtb address */
+ 	raw_dcache_line_size x15, x0		/* x15 = dcache line size */
+ 	mov	x14, xzr			/* x14 = entry ptr */
+ 	mov	x13, xzr			/* x13 = copy dest */
+@@ -106,8 +107,8 @@ ENTRY(arm64_relocate_new_kernel)
+ 	dsb	nsh
+ 	isb
+ 
+-	/* Start new image. */
+-	mov	x0, xzr
++	/* Start new image.  arm64 requires x0 = physical DTB address. */
++	mov	x0, x18
+ 	mov	x1, xzr
+ 	mov	x2, xzr
+ 	mov	x3, xzr
+diff --git a/arch/arm64/mm/proc.S b/arch/arm64/mm/proc.S
+index d40c37bf2..f166728cd 100644
+--- a/arch/arm64/mm/proc.S
++++ b/arch/arm64/mm/proc.S
+@@ -86,7 +86,7 @@ ENTRY(cpu_reset)
+ 	ret	x0
+ ENDPROC(cpu_reset)
+ 
+-ENTRY(cpu_soft_restart)
++ENTRY(cpu_soft_restart_legacy)
+ 	/* Save address of cpu_reset() and reset address */
+ 	mov	x19, x0
+ 	mov	x20, x1
+@@ -99,7 +99,7 @@ ENTRY(cpu_soft_restart)
+ 
+ 	mov	x0, x20
+ 	ret	x19
+-ENDPROC(cpu_soft_restart)
++ENDPROC(cpu_soft_restart_legacy)
+ 
+ /*
+  *	cpu_do_idle()
+diff --git a/drivers/base/dd.c b/drivers/base/dd.c
+index 3bc011d40..fa7e68ab1 100644
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -261,14 +261,10 @@ __setup("deferred_probe_timeout=", deferred_probe_timeout_setup);
+  */
+ int driver_deferred_probe_check_state(struct device *dev)
+ {
+-	if (initcalls_done) {
+-		if (!deferred_probe_timeout) {
+-			dev_WARN(dev, "deferred probe timeout, ignoring dependency");
+-			return -ETIMEDOUT;
+-		}
+-		dev_warn(dev, "ignoring dependency for device, assuming no driver");
+-		return -ENODEV;
+-	}
++	/* TB371FC: audio child devices are only instantiated once the ADSP has
++	 * booted, which happens after initcalls.  Giving up here permanently
++	 * breaks pinctrl/SWR probe ordering, so always let the device defer.
++	 */
+ 	return -EPROBE_DEFER;
+ }
+ 
+diff --git a/drivers/bluetooth/btqca.c b/drivers/bluetooth/btqca.c
+index 9e70f7c7e..9b63da3c0 100644
+--- a/drivers/bluetooth/btqca.c
++++ b/drivers/bluetooth/btqca.c
+@@ -27,19 +27,32 @@
+ 
+ #define VERSION "0.1"
+ 
+-int qca_read_soc_version(struct hci_dev *hdev, u32 *soc_version)
++int qca_read_soc_version(struct hci_dev *hdev, u32 *soc_version,
++			 enum qca_btsoc_type soc_type)
+ {
+ 	struct sk_buff *skb;
+ 	struct edl_event_hdr *edl;
+ 	struct rome_version *ver;
+ 	char cmd;
+ 	int err = 0;
++	u8 event_type = HCI_EV_VENDOR;
++	u8 rlen = sizeof(*edl) + sizeof(*ver);
++	u8 rtype = EDL_APP_VER_RES_EVT;
+ 
+ 	bt_dev_dbg(hdev, "QCA Version Request");
+ 
++	/* Unlike the other SoCs, QCA6390 sends the version response as the
++	 * payload of a command complete event, with one extra leading byte.
++	 */
++	if (soc_type == QCA_QCA6390) {
++		event_type = 0;
++		rlen += 1;
++		rtype = EDL_PATCH_VER_REQ_CMD;
++	}
++
+ 	cmd = EDL_PATCH_VER_REQ_CMD;
+ 	skb = __hci_cmd_sync_ev(hdev, EDL_PATCH_CMD_OPCODE, EDL_PATCH_CMD_LEN,
+-				&cmd, HCI_EV_VENDOR, HCI_INIT_TIMEOUT);
++				&cmd, event_type, HCI_INIT_TIMEOUT);
+ 	if (IS_ERR(skb)) {
+ 		err = PTR_ERR(skb);
+ 		bt_dev_err(hdev, "Reading QCA version information failed (%d)",
+@@ -47,7 +60,7 @@ int qca_read_soc_version(struct hci_dev *hdev, u32 *soc_version)
+ 		return err;
+ 	}
+ 
+-	if (skb->len != sizeof(*edl) + sizeof(*ver)) {
++	if (skb->len != rlen) {
+ 		bt_dev_err(hdev, "QCA Version size mismatch len %d", skb->len);
+ 		err = -EILSEQ;
+ 		goto out;
+@@ -61,19 +74,26 @@ int qca_read_soc_version(struct hci_dev *hdev, u32 *soc_version)
+ 	}
+ 
+ 	if (edl->cresp != EDL_CMD_REQ_RES_EVT ||
+-	    edl->rtype != EDL_APP_VER_RES_EVT) {
++	    edl->rtype != rtype) {
+ 		bt_dev_err(hdev, "QCA Wrong packet received %d %d", edl->cresp,
+ 			   edl->rtype);
+ 		err = -EIO;
+ 		goto out;
+ 	}
+ 
+-	ver = (struct rome_version *)(edl->data);
++	if (soc_type == QCA_QCA6390)
++		ver = (struct rome_version *)(edl->data + 1);
++	else
++		ver = (struct rome_version *)(edl->data);
+ 
+-	BT_DBG("%s: Product:0x%08x", hdev->name, le32_to_cpu(ver->product_id));
+-	BT_DBG("%s: Patch  :0x%08x", hdev->name, le16_to_cpu(ver->patch_ver));
+-	BT_DBG("%s: ROM    :0x%08x", hdev->name, le16_to_cpu(ver->rome_ver));
+-	BT_DBG("%s: SOC    :0x%08x", hdev->name, le32_to_cpu(ver->soc_id));
++	bt_dev_info(hdev, "QCA Product ID   :0x%08x",
++		    le32_to_cpu(ver->product_id));
++	bt_dev_info(hdev, "QCA Patch Version:0x%08x",
++		    le16_to_cpu(ver->patch_ver));
++	bt_dev_info(hdev, "QCA ROM Version  :0x%08x",
++		    le16_to_cpu(ver->rome_ver));
++	bt_dev_info(hdev, "QCA SOC Version  :0x%08x",
++		    le32_to_cpu(ver->soc_id));
+ 
+ 	/* QCA chipset version can be decided by patch and SoC
+ 	 * version, combination with upper 2 bytes from SoC
+@@ -113,7 +133,8 @@ static int qca_send_reset(struct hci_dev *hdev)
+ }
+ 
+ static void qca_tlv_check_data(struct rome_config *config,
+-				const struct firmware *fw)
++				const struct firmware *fw,
++				enum qca_btsoc_type soc_type)
+ {
+ 	const u8 *data;
+ 	u32 type_len;
+@@ -184,11 +205,19 @@ static void qca_tlv_check_data(struct rome_config *config,
+ 				/* HCI transport layer parameters
+ 				 * enabling software inband sleep
+ 				 * onto controller side.
++				 * QCA6390 is left out: its IBS wake handshake
++				 * does not work on this board.
+ 				 */
+-				tlv_nvm->data[0] |= 0x80;
++				if (soc_type != QCA_QCA6390)
++					tlv_nvm->data[0] |= 0x80;
+ 
+-				/* UART Baud Rate */
+-				tlv_nvm->data[2] = config->user_baud_rate;
++				/* UART Baud Rate: QCA6390 keeps it in a
++				 * different byte than the older SoCs.
++				 */
++				if (soc_type == QCA_QCA6390)
++					tlv_nvm->data[1] = config->user_baud_rate;
++				else
++					tlv_nvm->data[2] = config->user_baud_rate;
+ 
+ 				break;
+ 
+@@ -212,12 +241,16 @@ static void qca_tlv_check_data(struct rome_config *config,
+ }
+ 
+ static int qca_tlv_send_segment(struct hci_dev *hdev, int seg_size,
+-				 const u8 *data, enum rome_tlv_dnld_mode mode)
++				 const u8 *data, enum rome_tlv_dnld_mode mode,
++				 enum qca_btsoc_type soc_type)
+ {
+ 	struct sk_buff *skb;
+ 	struct edl_event_hdr *edl;
+ 	struct tlv_seg_resp *tlv_resp;
+ 	u8 cmd[MAX_SIZE_PER_TLV_SEGMENT + 2];
++	u8 event_type = HCI_EV_VENDOR;
++	u8 rlen = sizeof(*edl) + sizeof(*tlv_resp);
++	u8 rtype = EDL_TVL_DNLD_RES_EVT;
+ 	int err = 0;
+ 
+ 	cmd[0] = EDL_PATCH_TLV_REQ_CMD;
+@@ -228,15 +261,24 @@ static int qca_tlv_send_segment(struct hci_dev *hdev, int seg_size,
+ 		return __hci_cmd_send(hdev, EDL_PATCH_CMD_OPCODE, seg_size + 2,
+ 				      cmd);
+ 
++	/* QCA6390 acks a segment with a command complete event carrying
++	 * only the status and the echoed command byte.
++	 */
++	if (soc_type == QCA_QCA6390) {
++		event_type = 0;
++		rlen = sizeof(*edl);
++		rtype = EDL_PATCH_TLV_REQ_CMD;
++	}
++
+ 	skb = __hci_cmd_sync_ev(hdev, EDL_PATCH_CMD_OPCODE, seg_size + 2, cmd,
+-				HCI_EV_VENDOR, HCI_INIT_TIMEOUT);
++				event_type, HCI_INIT_TIMEOUT);
+ 	if (IS_ERR(skb)) {
+ 		err = PTR_ERR(skb);
+ 		bt_dev_err(hdev, "QCA Failed to send TLV segment (%d)", err);
+ 		return err;
+ 	}
+ 
+-	if (skb->len != sizeof(*edl) + sizeof(*tlv_resp)) {
++	if (skb->len != rlen) {
+ 		bt_dev_err(hdev, "QCA TLV response size mismatch");
+ 		err = -EILSEQ;
+ 		goto out;
+@@ -249,10 +291,18 @@ static int qca_tlv_send_segment(struct hci_dev *hdev, int seg_size,
+ 		goto out;
+ 	}
+ 
+-	tlv_resp = (struct tlv_seg_resp *)(edl->data);
++	if (edl->cresp != EDL_CMD_REQ_RES_EVT || edl->rtype != rtype) {
++		bt_dev_err(hdev, "QCA TLV with error stat 0x%x rtype 0x%x",
++			   edl->cresp, edl->rtype);
++		err = -EIO;
++		goto out;
++	}
+ 
+-	if (edl->cresp != EDL_CMD_REQ_RES_EVT ||
+-	    edl->rtype != EDL_TVL_DNLD_RES_EVT || tlv_resp->result != 0x00) {
++	if (soc_type == QCA_QCA6390)
++		goto out;
++
++	tlv_resp = (struct tlv_seg_resp *)(edl->data);
++	if (tlv_resp->result != 0x00) {
+ 		bt_dev_err(hdev, "QCA TLV with error stat 0x%x rtype 0x%x (0x%x)",
+ 			   edl->cresp, edl->rtype, tlv_resp->result);
+ 		err = -EIO;
+@@ -265,9 +315,12 @@ out:
+ }
+ 
+ static int qca_download_firmware(struct hci_dev *hdev,
+-				  struct rome_config *config)
++				  struct rome_config *config,
++				  enum qca_btsoc_type soc_type)
+ {
+ 	const struct firmware *fw;
++	struct firmware fw_copy;
++	u8 *buf;
+ 	const u8 *segment;
+ 	int ret, remain, i = 0;
+ 
+@@ -280,10 +333,22 @@ static int qca_download_firmware(struct hci_dev *hdev,
+ 		return ret;
+ 	}
+ 
+-	qca_tlv_check_data(config, fw);
++	/* qca_tlv_check_data patches the NVM bytes in place. Firmware
++	 * embedded in the kernel lives in read-only memory, so work on a
++	 * writable copy.
++	 */
++	buf = kmemdup(fw->data, fw->size, GFP_KERNEL);
++	if (!buf) {
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++	fw_copy.data = buf;
++	fw_copy.size = fw->size;
++
++	qca_tlv_check_data(config, &fw_copy, soc_type);
+ 
+-	segment = fw->data;
+-	remain = fw->size;
++	segment = fw_copy.data;
++	remain = fw_copy.size;
+ 	while (remain > 0) {
+ 		int segsize = min(MAX_SIZE_PER_TLV_SEGMENT, remain);
+ 
+@@ -295,13 +360,14 @@ static int qca_download_firmware(struct hci_dev *hdev,
+ 			config->dnld_mode = ROME_SKIP_EVT_NONE;
+ 
+ 		ret = qca_tlv_send_segment(hdev, segsize, segment,
+-					    config->dnld_mode);
++					    config->dnld_mode, soc_type);
+ 		if (ret)
+ 			break;
+ 
+ 		segment += segsize;
+ 	}
+ 
++	kfree(buf);
+ 	release_firmware(fw);
+ 
+ 	return ret;
+@@ -352,12 +418,15 @@ int qca_uart_setup(struct hci_dev *hdev, uint8_t baudrate,
+ 			    (soc_ver & 0x0000000f);
+ 		snprintf(config.fwname, sizeof(config.fwname),
+ 			 "qca/crbtfw%02x.tlv", rom_ver);
++	} else if (soc_type == QCA_QCA6390) {
++		snprintf(config.fwname, sizeof(config.fwname),
++			 "qca/htbtfw20.tlv");
+ 	} else {
+ 		snprintf(config.fwname, sizeof(config.fwname),
+ 			 "qca/rampatch_%08x.bin", soc_ver);
+ 	}
+ 
+-	err = qca_download_firmware(hdev, &config);
++	err = qca_download_firmware(hdev, &config, soc_type);
+ 	if (err < 0) {
+ 		bt_dev_err(hdev, "QCA Failed to download patch (%d)", err);
+ 		return err;
+@@ -371,11 +440,14 @@ int qca_uart_setup(struct hci_dev *hdev, uint8_t baudrate,
+ 	if (soc_type == QCA_WCN3990)
+ 		snprintf(config.fwname, sizeof(config.fwname),
+ 			 "qca/crnv%02x.bin", rom_ver);
++	else if (soc_type == QCA_QCA6390)
++		snprintf(config.fwname, sizeof(config.fwname),
++			 "qca/htnv20.bin");
+ 	else
+ 		snprintf(config.fwname, sizeof(config.fwname),
+ 			 "qca/nvm_%08x.bin", soc_ver);
+ 
+-	err = qca_download_firmware(hdev, &config);
++	err = qca_download_firmware(hdev, &config, soc_type);
+ 	if (err < 0) {
+ 		bt_dev_err(hdev, "QCA Failed to download NVM (%d)", err);
+ 		return err;
+diff --git a/drivers/bluetooth/btqca.h b/drivers/bluetooth/btqca.h
+index 0c01f375f..edf5e66e2 100644
+--- a/drivers/bluetooth/btqca.h
++++ b/drivers/bluetooth/btqca.h
+@@ -131,7 +131,8 @@ enum qca_btsoc_type {
+ 	QCA_INVALID = -1,
+ 	QCA_AR3002,
+ 	QCA_ROME,
+-	QCA_WCN3990
++	QCA_WCN3990,
++	QCA_QCA6390
+ };
+ 
+ #if IS_ENABLED(CONFIG_BT_QCA)
+@@ -139,7 +140,8 @@ enum qca_btsoc_type {
+ int qca_set_bdaddr_rome(struct hci_dev *hdev, const bdaddr_t *bdaddr);
+ int qca_uart_setup(struct hci_dev *hdev, uint8_t baudrate,
+ 		   enum qca_btsoc_type soc_type, u32 soc_ver);
+-int qca_read_soc_version(struct hci_dev *hdev, u32 *soc_version);
++int qca_read_soc_version(struct hci_dev *hdev, u32 *soc_version,
++			 enum qca_btsoc_type soc_type);
+ 
+ #else
+ 
+@@ -154,7 +156,8 @@ static inline int qca_uart_setup(struct hci_dev *hdev, uint8_t baudrate,
+ 	return -EOPNOTSUPP;
+ }
+ 
+-static inline int qca_read_soc_version(struct hci_dev *hdev, u32 *soc_version)
++static inline int qca_read_soc_version(struct hci_dev *hdev, u32 *soc_version,
++				       enum qca_btsoc_type soc_type)
+ {
+ 	return -EOPNOTSUPP;
+ }
+diff --git a/drivers/bluetooth/hci_qca.c b/drivers/bluetooth/hci_qca.c
+index f8b6823db..a75de82bf 100644
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@ -159,6 +159,7 @@ struct qca_power {
+ struct qca_serdev {
+ 	struct hci_uart	 serdev_hu;
+ 	struct gpio_desc *bt_en;
++	struct gpio_desc *sw_ctrl;
+ 	struct clk	 *susclk;
+ 	enum qca_btsoc_type btsoc_type;
+ 	struct qca_power *bt_power;
+@@ -441,6 +442,48 @@ static void hci_ibs_wake_retrans_timeout(struct timer_list *t)
+ 		hci_uart_tx_wakeup(hu);
+ }
+ 
++/*
++ * QCA6390 shares the combo chip rails with WCNSS. Power-up order follows the
++ * vendor bluetooth-power driver: regulators first, then reset_n low/high with
++ * 50 ms settling delays. Power is owned here (CONFIG_MSM_BT_POWER is off), so
++ * no other driver fights over the reset/sw_ctrl GPIOs.
++ */
++static int qca6390_power_on(struct hci_uart *hu)
++{
++	struct qca_serdev *qcadev = serdev_device_get_drvdata(hu->serdev);
++	int ret;
++
++	ret = qca_power_setup(hu, true);
++	if (ret) {
++		BT_ERR("QCA6390 regulator power on failed: %d", ret);
++		return ret;
++	}
++
++	if (qcadev->bt_en) {
++		gpiod_set_value_cansleep(qcadev->bt_en, 0);
++		msleep(50);
++		gpiod_set_value_cansleep(qcadev->bt_en, 1);
++		msleep(50);
++	}
++
++	if (qcadev->sw_ctrl)
++		dev_info(&hu->serdev->dev, "SW_CTRL is %d",
++			 gpiod_get_value_cansleep(qcadev->sw_ctrl));
++	return 0;
++}
++
++static void qca6390_power_off(struct hci_uart *hu)
++{
++	struct qca_serdev *qcadev = serdev_device_get_drvdata(hu->serdev);
++
++	if (qcadev->bt_en) {
++		gpiod_set_value_cansleep(qcadev->bt_en, 0);
++		msleep(100);
++	}
++
++	qca_power_setup(hu, false);
++}
++
+ /* Initialize protocol */
+ static int qca_open(struct hci_uart *hu)
+ {
+@@ -449,7 +492,6 @@ static int qca_open(struct hci_uart *hu)
+ 	int ret;
+ 
+ 	BT_DBG("hu %p qca_open", hu);
+-
+ 	if (!hci_uart_has_flow_control(hu))
+ 		return -EOPNOTSUPP;
+ 
+@@ -505,11 +547,7 @@ static int qca_open(struct hci_uart *hu)
+ 		serdev_device_open(hu->serdev);
+ 
+ 		qcadev = serdev_device_get_drvdata(hu->serdev);
+-		if (qcadev->btsoc_type != QCA_WCN3990) {
+-			gpiod_set_value_cansleep(qcadev->bt_en, 1);
+-			/* Controller needs time to bootup. */
+-			msleep(150);
+-		} else {
++		if (qcadev->btsoc_type == QCA_WCN3990) {
+ 			hu->init_speed = qcadev->init_speed;
+ 			hu->oper_speed = qcadev->oper_speed;
+ 			ret = qca_power_setup(hu, true);
+@@ -520,6 +558,21 @@ static int qca_open(struct hci_uart *hu)
+ 				kfree(qca);
+ 				return ret;
+ 			}
++		} else if (qcadev->btsoc_type == QCA_QCA6390) {
++			hu->init_speed = qcadev->init_speed;
++			hu->oper_speed = qcadev->oper_speed;
++			ret = qca6390_power_on(hu);
++			if (ret) {
++				destroy_workqueue(qca->workqueue);
++				kfree_skb(qca->rx_skb);
++				hu->priv = NULL;
++				kfree(qca);
++				return ret;
++			}
++		} else {
++			gpiod_set_value_cansleep(qcadev->bt_en, 1);
++			/* Controller needs time to bootup. */
++			msleep(150);
+ 		}
+ 	}
+ 
+@@ -615,6 +668,8 @@ static int qca_close(struct hci_uart *hu)
+ 		qcadev = serdev_device_get_drvdata(hu->serdev);
+ 		if (qcadev->btsoc_type == QCA_WCN3990)
+ 			qca_power_shutdown(hu);
++		else if (qcadev->btsoc_type == QCA_QCA6390)
++			qca6390_power_off(hu);
+ 		else
+ 			gpiod_set_value_cansleep(qcadev->bt_en, 0);
+ 
+@@ -1163,11 +1218,14 @@ static int qca_setup(struct hci_uart *hu)
+ 		if (ret)
+ 			return ret;
+ 
+-		ret = qca_read_soc_version(hdev, &soc_ver);
++		ret = qca_read_soc_version(hdev, &soc_ver, QCA_WCN3990);
+ 		if (ret)
+ 			return ret;
+ 	} else {
+-		bt_dev_info(hdev, "ROME setup");
++		if (qcadev->btsoc_type == QCA_QCA6390)
++			bt_dev_info(hdev, "setting up QCA6390");
++		else
++			bt_dev_info(hdev, "ROME setup");
+ 		qca_set_speed(hu, QCA_INIT_SPEED);
+ 	}
+ 
+@@ -1183,7 +1241,7 @@ static int qca_setup(struct hci_uart *hu)
+ 
+ 	if (qcadev->btsoc_type != QCA_WCN3990) {
+ 		/* Get QCA version information */
+-		ret = qca_read_soc_version(hdev, &soc_ver);
++		ret = qca_read_soc_version(hdev, &soc_ver, qcadev->btsoc_type);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -1192,7 +1250,11 @@ static int qca_setup(struct hci_uart *hu)
+ 	/* Setup patch / NVM configurations */
+ 	ret = qca_uart_setup(hdev, qca_baudrate, qcadev->btsoc_type, soc_ver);
+ 	if (!ret) {
+-		set_bit(STATE_IN_BAND_SLEEP_ENABLED, &qca->flags);
++		/* QCA6390 ignores the IBS wake byte on this board, so it is
++		 * kept on plain H4 (no in-band sleep).
++		 */
++		if (qcadev->btsoc_type != QCA_QCA6390)
++			set_bit(STATE_IN_BAND_SLEEP_ENABLED, &qca->flags);
+ 		qca_debugfs_init(hdev);
+ 	} else if (ret == -ENOENT) {
+ 		/* No patch/nvm-config found, run with original fw/config */
+@@ -1237,6 +1299,18 @@ static const struct qca_vreg_data qca_soc_data = {
+ 	.num_vregs = 4,
+ };
+ 
++static const struct qca_vreg_data qca_soc_data_qca6390 = {
++	.soc_type = QCA_QCA6390,
++	.vregs = (struct qca_vreg []) {
++		{ "vdd-aon",   950000,  950000,      0 },
++		{ "vdd-dig",   950000,  952000,      0 },
++		{ "vdd-rfa1", 1900000, 1900000,      0 },
++		{ "vdd-rfa2", 1350000, 1350000,      0 },
++		{ "vdd-asd",  3022464, 3304000,  10000 },
++	},
++	.num_vregs = 5,
++};
++
+ static void qca_power_shutdown(struct hci_uart *hu)
+ {
+ 	struct serdev_device *serdev = hu->serdev;
+@@ -1355,8 +1429,9 @@ static int qca_serdev_probe(struct serdev_device *serdev)
+ 	qcadev->serdev_hu.serdev = serdev;
+ 	data = of_device_get_match_data(&serdev->dev);
+ 	serdev_device_set_drvdata(serdev, qcadev);
+-	if (data && data->soc_type == QCA_WCN3990) {
+-		qcadev->btsoc_type = QCA_WCN3990;
++	if (data && (data->soc_type == QCA_WCN3990 ||
++		     data->soc_type == QCA_QCA6390)) {
++		qcadev->btsoc_type = data->soc_type;
+ 		qcadev->bt_power = devm_kzalloc(&serdev->dev,
+ 						sizeof(struct qca_power),
+ 						GFP_KERNEL);
+@@ -1374,6 +1449,25 @@ static int qca_serdev_probe(struct serdev_device *serdev)
+ 
+ 		qcadev->bt_power->vregs_on = false;
+ 
++		if (qcadev->btsoc_type == QCA_QCA6390) {
++			qcadev->bt_en = devm_gpiod_get(&serdev->dev, "enable",
++						       GPIOD_OUT_LOW);
++			if (IS_ERR(qcadev->bt_en)) {
++				err = PTR_ERR(qcadev->bt_en);
++				BT_ERR("failed to acquire reset gpio:%d", err);
++				goto out;
++			}
++
++			qcadev->sw_ctrl = devm_gpiod_get_optional(&serdev->dev,
++								  "swctrl",
++								  GPIOD_IN);
++			if (IS_ERR(qcadev->sw_ctrl)) {
++				err = PTR_ERR(qcadev->sw_ctrl);
++				BT_ERR("failed to acquire sw_ctrl gpio:%d", err);
++				goto out;
++			}
++		}
++
+ 		device_property_read_u32(&serdev->dev, "max-speed",
+ 					 &qcadev->oper_speed);
+ 		if (!qcadev->oper_speed)
+@@ -1381,7 +1475,7 @@ static int qca_serdev_probe(struct serdev_device *serdev)
+ 
+ 		err = hci_uart_register_device(&qcadev->serdev_hu, &qca_proto);
+ 		if (err) {
+-			BT_ERR("wcn3990 serdev registration failed");
++			BT_ERR("serdev registration failed");
+ 			goto out;
+ 		}
+ 	} else {
+@@ -1422,6 +1516,8 @@ static void qca_serdev_remove(struct serdev_device *serdev)
+ 
+ 	if (qcadev->btsoc_type == QCA_WCN3990)
+ 		qca_power_shutdown(&qcadev->serdev_hu);
++	else if (qcadev->btsoc_type == QCA_QCA6390)
++		qca6390_power_off(&qcadev->serdev_hu);
+ 	else
+ 		clk_disable_unprepare(qcadev->susclk);
+ 
+@@ -1430,6 +1526,7 @@ static void qca_serdev_remove(struct serdev_device *serdev)
+ 
+ static const struct of_device_id qca_bluetooth_of_match[] = {
+ 	{ .compatible = "qcom,qca6174-bt" },
++	{ .compatible = "qcom,qca6390-bt", .data = &qca_soc_data_qca6390},
+ 	{ .compatible = "qcom,wcn3990-bt", .data = &qca_soc_data},
+ 	{ /* sentinel */ }
+ };
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index a6771cef8..58d930c54 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -87,7 +87,8 @@ obj-y			+= tilcdc/
+ obj-$(CONFIG_DRM_QXL) += qxl/
+ obj-$(CONFIG_DRM_BOCHS) += bochs/
+ obj-$(CONFIG_DRM_VIRTIO_GPU) += virtio/
+-obj-$(CONFIG_DRM_MSM) += msm/
++# techpack display owns CONFIG_DRM_MSM
++obj-n += msm/
+ obj-$(CONFIG_DRM_TEGRA) += tegra/
+ obj-$(CONFIG_DRM_STM) += stm/
+ obj-$(CONFIG_DRM_STI) += sti/
+diff --git a/drivers/input/touchscreen/nt36532/nt36xxx.c b/drivers/input/touchscreen/nt36532/nt36xxx.c
+old mode 100755
+new mode 100644
+index 79d95e099..2a7cd13de
+--- a/drivers/input/touchscreen/nt36532/nt36xxx.c
++++ b/drivers/input/touchscreen/nt36532/nt36xxx.c
+@@ -1520,12 +1520,17 @@ static int nvt_drm_panel_notifier_callback(struct notifier_block *nb,
+ 		       "nvt_drm_panel_notifier_callback", event, blank_val);
+ 		if (nvt_gesture_flag)
+ 			cancel_delayed_work_sync(&nvt_hall_check_work);
+-		if (bTouchIsAwake) {
+-			pr_err("[%s] %s %d: Touch is already resume\n",
++		/*
++		 * TB371FC: do not trust bTouchIsAwake here. A blank/unblank
++		 * cycle without a matching POWERDOWN (DPMS, compositor restart)
++		 * can leave the touch IC off while the flag is still 1; the old
++		 * short-circuit then skipped the reset and the controller never
++		 * generated IRQs again. Always re-init on unblank (stock does a
++		 * firmware download on every resume as well).
++		 */
++		if (bTouchIsAwake)
++			pr_err("[%s] %s %d: awake flag set, re-initialising anyway\n",
+ 			       "NVT-ts", "nvt_ts_resume", 3183);
+-			kb_hid_resume();
+-			return NOTIFY_OK;
+-		}
+ 		mutex_lock(&nvt_ts->lock);
+ 		pr_err("[%s] %s %d: start\n",
+ 		       "NVT-ts", "nvt_ts_resume", 3189);
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 091f0f616..2c0c0b508 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -83,3 +83,4 @@ obj-$(CONFIG_KINECTICS_XR_NORDIC) += kxrctrl/
+ obj-$(CONFIG_HQHARDWARE_INFO) += huaqinhardware_info/
+ obj-$(CONFIG_HQ_SYSFS_SUPPORT) += hqsysfs/
+ obj-$(CONFIG_NTSYNC)		+= ntsync.o
++# disabled for bridge build: obj-y += tb371fc_stubs.o
+diff --git a/drivers/misc/tb371fc_stubs.c b/drivers/misc/tb371fc_stubs.c
+new file mode 100644
+index 000000000..536c86764
+--- /dev/null
++++ b/drivers/misc/tb371fc_stubs.c
+@@ -0,0 +1,19 @@
++// TB371FC build stubs: symbols normally exported by vendor drivers that are
++// disabled in this minimal kexec-trampoline kernel.
++#include <linux/types.h>
++#include <linux/module.h>
++
++int usb_is_plugin(bool enabled)
++{
++	return 0;
++}
++EXPORT_SYMBOL(usb_is_plugin);
++
++struct goodix_ts_core;
++struct goodix_ts_core *cd_next;
++EXPORT_SYMBOL(cd_next);
++
++void goodix_tp_reset(void)
++{
++}
++EXPORT_SYMBOL(goodix_tp_reset);
+diff --git a/drivers/net/wireless/cnss2/main.c b/drivers/net/wireless/cnss2/main.c
+index 1d38cdf05..3fcf26c05 100644
+--- a/drivers/net/wireless/cnss2/main.c
++++ b/drivers/net/wireless/cnss2/main.c
+@@ -2605,9 +2605,9 @@ static void cnss_misc_deinit(struct cnss_plat_data *plat_priv)
+ static void cnss_init_control_params(struct cnss_plat_data *plat_priv)
+ {
+ 	plat_priv->ctrl_params.quirks = CNSS_QUIRKS_DEFAULT;
+-	if (of_property_read_bool(plat_priv->plat_dev->dev.of_node,
+-				  "cnss-daemon-support"))
+-		plat_priv->ctrl_params.quirks |= BIT(ENABLE_DAEMON_SUPPORT);
++	/* No cnss-daemon on this rootfs; announce a single QMI client so the
++	 * firmware does not wait for a second one before sending indications.
++	 */
+ 
+ 	plat_priv->ctrl_params.mhi_timeout = CNSS_MHI_TIMEOUT_DEFAULT;
+ 	plat_priv->ctrl_params.mhi_m2_timeout = CNSS_MHI_M2_TIMEOUT_DEFAULT;
+diff --git a/drivers/power/supply/power_supply_sysfs.c b/drivers/power/supply/power_supply_sysfs.c
+index 1a0d50ca6..05d9753f7 100644
+--- a/drivers/power/supply/power_supply_sysfs.c
++++ b/drivers/power/supply/power_supply_sysfs.c
+@@ -636,8 +636,12 @@ int power_supply_uevent(struct device *dev, struct kobj_uevent_env *env)
+ 			continue;
+ 		}
+ 
+-		if (ret < 0)
+-			goto out;
++		if (ret < 0) {
++			/* Some supplies advertise properties they cannot
++			 * report; don't abort the whole uevent for them. */
++			ret = 0;
++			continue;
++		}
+ 
+ 		line = strchr(prop_buf, '\n');
+ 		if (line)
+diff --git a/drivers/power/supply/qcom/qpnp-smb5.c b/drivers/power/supply/qcom/qpnp-smb5.c
+index 30aebc572..4f863cfe0 100644
+--- a/drivers/power/supply/qcom/qpnp-smb5.c
++++ b/drivers/power/supply/qcom/qpnp-smb5.c
+@@ -1789,12 +1789,10 @@ static enum power_supply_property smb5_batt_props[] = {
+ 	POWER_SUPPLY_PROP_CHARGE_FULL,
+ 	POWER_SUPPLY_PROP_FORCE_RECHARGE,
+ 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+-	POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
+ 	POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE,
+ 	POWER_SUPPLY_PROP_CHARGING_ENABLED,
+ #ifdef CONFIG_SPINEL_CHARGER
+ 	POWER_SUPPLY_PROP_MAIN_CHARGE_INFO,
+-	POWER_SUPPLY_PROP_CHARGE_DISABLE,
+ 	POWER_SUPPLY_PROP_BM_ENABLE,
+ 	POWER_SUPPLY_PROP_BM2_ENABLE,
+ 	POWER_SUPPLY_PROP_BP_ENABLE,
+diff --git a/drivers/power/supply/qcom/smb5-lib.c b/drivers/power/supply/qcom/smb5-lib.c
+index bf77d98f0..a1cffc45c 100644
+--- a/drivers/power/supply/qcom/smb5-lib.c
++++ b/drivers/power/supply/qcom/smb5-lib.c
+@@ -2485,10 +2485,6 @@ int smblib_get_batt_current_now(struct smb_charger *chg,
+ 	rc = smblib_get_prop_from_exfg(chg,
+ 		POWER_SUPPLY_PROP_CURRENT_NOW, val);
+ 
+-	if (!chg->exfg_psy){
+-		val->intval *= (-1);
+-	}
+-
+ 	return rc;
+ }
+ 
+diff --git a/drivers/regulator/core.c b/drivers/regulator/core.c
+index 66cce1fe4..a33cf57aa 100644
+--- a/drivers/regulator/core.c
++++ b/drivers/regulator/core.c
+@@ -41,6 +41,20 @@
+ #include "dummy.h"
+ #include "internal.h"
+ 
++/*
++ * TB371FC: keep bootloader-configured supplies (panel AVDD, DSI bias, ...)
++ * enabled when the command line asks for it.  Upstream 6.12 offers this
++ * option; the vendor 4.19 regulator core does not.
++ */
++static bool regulator_ignore_unused;
++
++static int __init regulator_ignore_unused_setup(char *str)
++{
++	regulator_ignore_unused = true;
++	return 1;
++}
++__setup("regulator_ignore_unused", regulator_ignore_unused_setup);
++
+ #define rdev_crit(rdev, fmt, ...)					\
+ 	pr_crit("%s: " fmt, rdev_get_name(rdev), ##__VA_ARGS__)
+ #define rdev_err(rdev, fmt, ...)					\
+@@ -5443,6 +5457,11 @@ unlock:
+ 
+ static void regulator_init_complete_work_function(struct work_struct *work)
+ {
++	if (regulator_ignore_unused) {
++		pr_info("regulator: Not disabling unused regulators\n");
++		return;
++	}
++
+ 	/*
+ 	 * Regulators may had failed to resolve their input supplies
+ 	 * when were registered, either because the input supply was
+diff --git a/drivers/soc/qcom/watchdog_v2.c b/drivers/soc/qcom/watchdog_v2.c
+index c9996ffaf..44c35742e 100644
+--- a/drivers/soc/qcom/watchdog_v2.c
++++ b/drivers/soc/qcom/watchdog_v2.c
+@@ -13,6 +13,7 @@
+ #include <linux/slab.h>
+ #include <linux/jiffies.h>
+ #include <linux/kthread.h>
++#include <linux/kexec.h>
+ #include <linux/mutex.h>
+ #include <linux/sched.h>
+ #include <linux/interrupt.h>
+@@ -1058,6 +1059,23 @@ err:
+ 	return ret;
+ }
+ 
++static void msm_watchdog_shutdown(struct platform_device *pdev)
++{
++	struct msm_watchdog_data *wdog_dd = platform_get_drvdata(pdev);
++
++	if (!wdog_dd || !kexec_in_progress)
++		return;
++
++	pr_info("MSM watchdog: disabling the local APSS watchdog for kexec\n");
++	/* Clear only WDT0_EN. The secure watchdog is left to firmware; the pet
++	 * kthread may keep writing WDT0_RST but cannot re-enable this watchdog. */
++	mutex_lock(&wdog_dd->disable_lock);
++	__raw_writel(0, wdog_dd->base + WDT0_EN);
++	mb();
++	__raw_writel(0, wdog_dd->base + WDT0_EN);
++	mutex_unlock(&wdog_dd->disable_lock);
++}
++
+ static const struct dev_pm_ops msm_watchdog_dev_pm_ops = {
+ 	.suspend_noirq = msm_watchdog_suspend,
+ 	.resume_noirq = msm_watchdog_resume,
+@@ -1066,6 +1084,7 @@ static const struct dev_pm_ops msm_watchdog_dev_pm_ops = {
+ static struct platform_driver msm_watchdog_driver = {
+ 	.probe = msm_watchdog_probe,
+ 	.remove = msm_watchdog_remove,
++	.shutdown = msm_watchdog_shutdown,
+ 	.driver = {
+ 		.name = MODULE_NAME,
+ 		.owner = THIS_MODULE,
+diff --git a/drivers/usb/dwc3/debug.h b/drivers/usb/dwc3/debug.h
+index ddd90d3a9..a75195bc1 100644
+--- a/drivers/usb/dwc3/debug.h
++++ b/drivers/usb/dwc3/debug.h
+@@ -711,11 +711,11 @@ void dwc3_dbg_dma_unmap(struct dwc3 *dwc, u8 ep_num,
+ 			struct dwc3_request *req);
+ 
+ #ifdef CONFIG_DEBUG_FS
+-extern void dwc3_debugfs_create_endpoint_dir(struct dwc3_ep *dep);
++extern void dwc3_debugfs_create_endpoint_dir(struct dwc3_ep *dep, struct dentry *parent);
+ extern void dwc3_debugfs_init(struct dwc3 *);
+ extern void dwc3_debugfs_exit(struct dwc3 *);
+ #else
+-static inline void dwc3_debugfs_create_endpoint_dir(struct dwc3_ep *dep)
++static inline void dwc3_debugfs_create_endpoint_dir(struct dwc3_ep *dep, struct dentry *parent)
+ {  }
+ static inline void dwc3_debugfs_init(struct dwc3 *d)
+ {  }
+diff --git a/drivers/usb/dwc3/debugfs.c b/drivers/usb/dwc3/debugfs.c
+index c5b7974e6..be58ea5ad 100644
+--- a/drivers/usb/dwc3/debugfs.c
++++ b/drivers/usb/dwc3/debugfs.c
+@@ -819,7 +819,7 @@ static void dwc3_debugfs_create_endpoint_files(struct dwc3_ep *dep,
+ 	}
+ }
+ 
+-static void dwc3_debugfs_create_endpoint_dir(struct dwc3_ep *dep,
++void dwc3_debugfs_create_endpoint_dir(struct dwc3_ep *dep,
+ 		struct dentry *parent)
+ {
+ 	struct dentry		*dir;
+diff --git a/fs/file.c b/fs/file.c
+index 64faefe4e..86e538a6d 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -636,6 +636,42 @@ out_unlock:
+ 	spin_unlock(&files->file_lock);
+ 	return -EBADF;
+ }
++
++SYSCALL_DEFINE3(close_range, unsigned int, fd, unsigned int, max_fd,
++		unsigned int, flags)
++{
++	struct files_struct *files = current->files;
++	struct fdtable *fdt;
++	unsigned int i, max;
++
++	if (flags)
++		return -EINVAL;
++	if (fd > max_fd)
++		return -EINVAL;
++
++	spin_lock(&files->file_lock);
++	fdt = files_fdtable(files);
++	if (!fdt->max_fds) {
++		spin_unlock(&files->file_lock);
++		return 0;
++	}
++	max = min(max_fd, fdt->max_fds - 1);
++	spin_unlock(&files->file_lock);
++
++	if (fd > max)
++		return 0;
++
++	for (i = fd; ; i++) {
++		int ret = __close_fd(files, i);
++
++		if (ret < 0 && ret != -EBADF)
++			return ret;
++		if (i == max)
++			break;
++	}
++
++	return 0;
++}
+ EXPORT_SYMBOL(__close_fd); /* for ksys_close() */
+ 
+ void do_close_on_exec(struct files_struct *files)
+diff --git a/fs/internal.h b/fs/internal.h
+index 8d0ca52e2..7264b26b7 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -119,7 +119,7 @@ extern struct file *do_file_open_root(struct dentry *, struct vfsmount *,
+ 		const char *, const struct open_flags *);
+ 
+ long do_sys_ftruncate(unsigned int fd, loff_t length, int small);
+-long do_faccessat(int dfd, const char __user *filename, int mode);
++long do_faccessat(int dfd, const char __user *filename, int mode, int flags);
+ int do_fchmodat(int dfd, const char __user *filename, umode_t mode);
+ int do_fchownat(int dfd, const char __user *filename, uid_t user, gid_t group,
+ 		int flag);
+diff --git a/fs/open.c b/fs/open.c
+index 155731594..ff12a24a3 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -353,7 +353,11 @@ SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
+  * We do this by temporarily clearing all FS-related capabilities and
+  * switching the fsuid/fsgid around to the real ones.
+  */
+-long do_faccessat(int dfd, const char __user *filename, int mode)
++#ifndef AT_EACCESS
++#define AT_EACCESS	0x200
++#endif
++
++long do_faccessat(int dfd, const char __user *filename, int mode, int flags)
+ {
+ 	const struct cred *old_cred;
+ 	struct cred *override_cred;
+@@ -366,6 +370,14 @@ long do_faccessat(int dfd, const char __user *filename, int mode)
+ 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
+ 		return -EINVAL;
+ 
++	if (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
++		return -EINVAL;
++
++	if (flags & AT_SYMLINK_NOFOLLOW)
++		lookup_flags &= ~LOOKUP_FOLLOW;
++	if (flags & AT_EMPTY_PATH)
++		lookup_flags |= LOOKUP_EMPTY;
++
+ 	override_cred = prepare_creds();
+ 	if (!override_cred)
+ 		return -ENOMEM;
+@@ -452,12 +464,18 @@ out:
+ 
+ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+ {
+-	return do_faccessat(dfd, filename, mode);
++	return do_faccessat(dfd, filename, mode, 0);
++}
++
++SYSCALL_DEFINE4(faccessat2, int, dfd, const char __user *, filename, int, mode,
++		int, flags)
++{
++	return do_faccessat(dfd, filename, mode, flags);
+ }
+ 
+ SYSCALL_DEFINE2(access, const char __user *, filename, int, mode)
+ {
+-	return do_faccessat(AT_FDCWD, filename, mode);
++	return do_faccessat(AT_FDCWD, filename, mode, 0);
+ }
+ 
+ int ksys_chdir(const char __user *filename)
+@@ -1271,3 +1289,13 @@ int stream_open(struct inode *inode, struct file *filp)
+ }
+ 
+ EXPORT_SYMBOL(stream_open);
++
++/*
++ * Stub: the new mount API is not available on 4.19.  Return EPERM so that
++ * callers (systemd) take their "no privilege to mount" fallback paths instead
++ * of aborting on ENOSYS.
++ */
++SYSCALL_DEFINE2(fsopen, const char __user *, fs_name, unsigned int, flags)
++{
++	return -EPERM;
++}
+diff --git a/fs/stat.c b/fs/stat.c
+index 376543199..94e3e920b 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -11,6 +11,8 @@
+ #include <linux/file.h>
+ #include <linux/highuid.h>
+ #include <linux/fs.h>
++#include <linux/mount.h>
++#include "mount.h"
+ #include <linux/namei.h>
+ #include <linux/security.h>
+ #include <linux/cred.h>
+@@ -187,6 +189,13 @@ retry:
+ 		goto out;
+ 
+ 	error = vfs_getattr(&path, stat, request_mask, flags);
++	if (!error) {
++		stat->mnt_id = real_mount(path.mnt)->mnt_id;
++		stat->result_mask |= STATX_MNT_ID;
++		if (path.mnt->mnt_root == path.dentry)
++			stat->attributes |= STATX_ATTR_MOUNT_ROOT;
++		stat->attributes_mask |= STATX_ATTR_MOUNT_ROOT;
++	}
+ 	path_put(&path);
+ 	if (retry_estale(error, lookup_flags)) {
+ 		lookup_flags |= LOOKUP_REVAL;
+@@ -547,6 +556,7 @@ cp_statx(const struct kstat *stat, struct statx __user *buffer)
+ 	tmp.stx_rdev_minor = MINOR(stat->rdev);
+ 	tmp.stx_dev_major = MAJOR(stat->dev);
+ 	tmp.stx_dev_minor = MINOR(stat->dev);
++	tmp.stx_mnt_id = stat->mnt_id;
+ 
+ 	return copy_to_user(buffer, &tmp, sizeof(tmp)) ? -EFAULT : 0;
+ }
+diff --git a/fs/utimes.c b/fs/utimes.c
+index 1039ef737..39e2c99a9 100644
+--- a/fs/utimes.c
++++ b/fs/utimes.c
+@@ -126,13 +126,13 @@ long do_utimes(int dfd, const char __user *filename, struct timespec64 *times,
+ 		goto out;
+ 	}
+ 
+-	if (flags & ~AT_SYMLINK_NOFOLLOW)
++	if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
+ 		goto out;
+ 
+ 	if (filename == NULL && dfd != AT_FDCWD) {
+ 		struct fd f;
+ 
+-		if (flags & AT_SYMLINK_NOFOLLOW)
++		if (flags)
+ 			goto out;
+ 
+ 		f = fdget(dfd);
+@@ -148,6 +148,8 @@ long do_utimes(int dfd, const char __user *filename, struct timespec64 *times,
+ 
+ 		if (!(flags & AT_SYMLINK_NOFOLLOW))
+ 			lookup_flags |= LOOKUP_FOLLOW;
++		if (flags & AT_EMPTY_PATH)
++			lookup_flags |= LOOKUP_EMPTY;
+ retry:
+ 		error = user_path_at(dfd, filename, lookup_flags, &path);
+ 		if (error)
+diff --git a/include/linux/stat.h b/include/linux/stat.h
+index 528c4baad..56614af83 100644
+--- a/include/linux/stat.h
++++ b/include/linux/stat.h
+@@ -47,6 +47,7 @@ struct kstat {
+ 	struct timespec64 ctime;
+ 	struct timespec64 btime;			/* File creation time */
+ 	u64		blocks;
++	u64		mnt_id;
+ };
+ 
+ #endif
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 895ff567a..ff79b4f95 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -852,6 +852,8 @@ asmlinkage long sys_clock_adjtime(clockid_t which_clock,
+ asmlinkage long sys_syncfs(int fd);
+ asmlinkage long sys_setns(int fd, int nstype);
+ asmlinkage long sys_pidfd_open(pid_t pid, unsigned int flags);
++asmlinkage long sys_close_range(unsigned int fd, unsigned int max_fd, unsigned int flags);
++asmlinkage long sys_fsopen(const char __user *fs_name, unsigned int flags);
+ asmlinkage long sys_sendmmsg(int fd, struct mmsghdr __user *msg,
+ 			     unsigned int vlen, unsigned flags);
+ asmlinkage long sys_process_vm_readv(pid_t pid,
+@@ -1228,11 +1230,11 @@ static inline int ksys_chmod(const char __user *filename, umode_t mode)
+ 	return do_fchmodat(AT_FDCWD, filename, mode);
+ }
+ 
+-extern long do_faccessat(int dfd, const char __user *filename, int mode);
++extern long do_faccessat(int dfd, const char __user *filename, int mode, int flags);
+ 
+ static inline long ksys_access(const char __user *filename, int mode)
+ {
+-	return do_faccessat(AT_FDCWD, filename, mode);
++	return do_faccessat(AT_FDCWD, filename, mode, 0);
+ }
+ 
+ extern int do_fchownat(int dfd, const char __user *filename, uid_t user,
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index be311b944..f1c5a4ed0 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -738,11 +738,17 @@ __SC_COMP(__NR_io_pgetevents, sys_io_pgetevents, compat_sys_io_pgetevents)
+ __SYSCALL(__NR_rseq, sys_rseq)
+ #define __NR_pidfd_send_signal 424
+ __SYSCALL(__NR_pidfd_send_signal, sys_pidfd_send_signal)
++#define __NR_fsopen 430
++__SYSCALL(__NR_fsopen, sys_fsopen)
+ #define __NR_pidfd_open 434
+ __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
++#define __NR_close_range 436
++__SYSCALL(__NR_close_range, sys_close_range)
++#define __NR_faccessat2 439
++__SYSCALL(__NR_faccessat2, sys_faccessat2)
+ 
+ #undef __NR_syscalls
+-#define __NR_syscalls 435
++#define __NR_syscalls 440
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/include/uapi/linux/stat.h b/include/uapi/linux/stat.h
+index ad80a5c88..da40dad95 100644
+--- a/include/uapi/linux/stat.h
++++ b/include/uapi/linux/stat.h
+@@ -123,7 +123,10 @@ struct statx {
+ 	__u32	stx_dev_major;	/* ID of device containing file [uncond] */
+ 	__u32	stx_dev_minor;
+ 	/* 0x90 */
+-	__u64	__spare2[14];	/* Spare space for future expansion */
++	__u64	stx_mnt_id;
++	__u64	__spare2;
++	/* 0xa0 */
++	__u64	__spare3[12];	/* Spare space for future expansion */
+ 	/* 0x100 */
+ };
+ 
+@@ -148,6 +151,7 @@ struct statx {
+ #define STATX_BLOCKS		0x00000400U	/* Want/got stx_blocks */
+ #define STATX_BASIC_STATS	0x000007ffU	/* The stuff in the normal stat struct */
+ #define STATX_BTIME		0x00000800U	/* Want/got stx_btime */
++#define STATX_MNT_ID		0x00001000U	/* Got stx_mnt_id */
+ #define STATX_ALL		0x00000fffU	/* All currently supported flags */
+ #define STATX__RESERVED		0x80000000U	/* Reserved for future struct statx expansion */
+ 
+@@ -168,6 +172,7 @@ struct statx {
+ #define STATX_ATTR_NODUMP		0x00000040 /* [I] File is not to be dumped */
+ #define STATX_ATTR_ENCRYPTED		0x00000800 /* [I] File requires key to decrypt in fs */
+ #define STATX_ATTR_AUTOMOUNT		0x00001000 /* Dir: Automount trigger */
++#define STATX_ATTR_MOUNT_ROOT		0x00002000 /* Root of a mount */
+ #define STATX_ATTR_VERITY		0x00100000 /* [I] Verity protected file */
+ 
+ 
+diff --git a/include/uapi/linux/wait.h b/include/uapi/linux/wait.h
+index ac49a220c..85b809fc9 100644
+--- a/include/uapi/linux/wait.h
++++ b/include/uapi/linux/wait.h
+@@ -17,6 +17,7 @@
+ #define P_ALL		0
+ #define P_PID		1
+ #define P_PGID		2
++#define P_PIDFD		3
+ 
+ 
+ #endif /* _UAPI_LINUX_WAIT_H */
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index e803885dc..3702d0edf 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -23,6 +23,7 @@
+ #include <linux/mutex.h>
+ #include <linux/gfp.h>
+ #include <linux/suspend.h>
++#include <linux/kexec.h>
+ #include <linux/lockdep.h>
+ #include <linux/tick.h>
+ #include <linux/irq.h>
+@@ -1355,7 +1356,7 @@ int freeze_secondary_cpus(int primary)
+ 		if (cpu == primary)
+ 			continue;
+ 
+-		if (pm_wakeup_pending()) {
++		if (!kexec_in_progress && pm_wakeup_pending()) {
+ 			pr_info("Wakeup pending. Abort CPU freeze\n");
+ 			error = -EBUSY;
+ 			break;
+diff --git a/kernel/exit.c b/kernel/exit.c
+index b9fcdc33c..0daf9665e 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -1630,6 +1630,8 @@ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
+ 	struct pid *pid = NULL;
+ 	enum pid_type type;
+ 	long ret;
++	struct fd f = {};
++	bool pidfd = false;
+ 
+ 	if (options & ~(WNOHANG|WNOWAIT|WEXITED|WSTOPPED|WCONTINUED|
+ 			__WNOTHREAD|__WCLONE|__WALL))
+@@ -1651,21 +1653,40 @@ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
+ 		if (upid <= 0)
+ 			return -EINVAL;
+ 		break;
++	case P_PIDFD:
++		type = PIDTYPE_PID;
++		if (upid < 0)
++			return -EINVAL;
++		f = fdget(upid);
++		if (!f.file)
++			return -EBADF;
++		if (f.file->f_op != &pidfd_fops) {
++			fdput(f);
++			return -EINVAL;
++		}
++		pid = f.file->private_data;
++		pidfd = true;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+ 
+-	if (type < PIDTYPE_MAX)
++	if (type < PIDTYPE_MAX && !pidfd)
+ 		pid = find_get_pid(upid);
+ 
+ 	wo.wo_type	= type;
+ 	wo.wo_pid	= pid;
+ 	wo.wo_flags	= options;
++	if (pidfd)
++		wo.wo_flags |= __WNOTHREAD;
+ 	wo.wo_info	= infop;
+ 	wo.wo_rusage	= ru;
+ 	ret = do_wait(&wo);
+ 
+-	put_pid(pid);
++	if (pidfd)
++		fdput(f);
++	else
++		put_pid(pid);
+ 	return ret;
+ }
+ 
+diff --git a/lib/zstd/common/compiler.h b/lib/zstd/common/compiler.h
+index 5ccff5fdf..0241d8c06 100644
+--- a/lib/zstd/common/compiler.h
++++ b/lib/zstd/common/compiler.h
+@@ -169,7 +169,7 @@
+  * - CPP17: https://en.cppreference.com/w/cpp/language/attributes/fallthrough
+  * - Else: __attribute__((__fallthrough__))
+  */
+-#define ZSTD_FALLTHROUGH __attribute__((__fallthrough__))
++#define ZSTD_FALLTHROUGH /* fallthrough */
+ 
+ /*-**************************************************************
+ *  Alignment
+diff --git a/scripts/Makefile.extrawarn b/scripts/Makefile.extrawarn
+index b8e796c8f..0af8cf6c6 100644
+--- a/scripts/Makefile.extrawarn
++++ b/scripts/Makefile.extrawarn
+@@ -74,7 +74,5 @@ KBUILD_CFLAGS += $(call cc-disable-warning, uninitialized)
+ KBUILD_CFLAGS += $(call cc-disable-warning, pointer-to-enum-cast)
+ KBUILD_CFLAGS += $(call cc-disable-warning, unaligned-access)
+ KBUILD_CFLAGS += $(call cc-disable-warning, cast-function-type-strict)
+-KBUILD_CFLAGS += -Wno-enum-compare-conditional
+-KBUILD_CFLAGS += -Wno-enum-enum-conversion
+ endif
+ endif
+diff --git a/tb371fc/scripts/p199-touch-resume-always.py b/tb371fc/scripts/p199-touch-resume-always.py
+new file mode 100755
+index 000000000..4caa5e85f
+--- /dev/null
++++ b/tb371fc/scripts/p199-touch-resume-always.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++"""p199 - always run the full touch resume on panel unblank.
++
++The NVT driver short-circuits DRM_PANEL_EVENT_BLANK/UNBLANK when
++bTouchIsAwake is already 1 ("Touch is already resume"). After a display
++blank/unblank cycle that did not deliver a matching POWERDOWN (DPMS /
++composer restart paths) the touch IC can be powered off while the flag
++stays 1, so every later unblank skips the reset + firmware download and
++the controller never generates IRQs again (observed IRQ 68 counter stuck
++at 13 while the panel was on).
++
++Always run the resume sequence on unblank.  It costs one firmware
++download (~200 ms) per screen-on, which is what stock does on resume.
++"""
++P = "/opt/kernel-tb371fc/drivers/input/touchscreen/nt36532/nt36xxx.c"
++NL = chr(10)
++T = chr(9)
++CONT = "       "  # 7 spaces used by the stock line continuation
++
++OLD = (
++    T + T + "if (bTouchIsAwake) {" + NL +
++    T + T + T + "pr_err(\"[%s] %s %d: Touch is already resume\\n\"," + NL +
++    T + T + T + CONT + "\"NVT-ts\", \"nvt_ts_resume\", 3183);" + NL +
++    T + T + T + "kb_hid_resume();" + NL +
++    T + T + T + "return NOTIFY_OK;" + NL +
++    T + T + "}" + NL
++)
++NEW = (
++    T + T + "/*" + NL +
++    T + T + " * TB371FC: do not trust bTouchIsAwake here. A blank/unblank" + NL +
++    T + T + " * cycle without a matching POWERDOWN (DPMS, compositor restart)" + NL +
++    T + T + " * can leave the touch IC off while the flag is still 1; the old" + NL +
++    T + T + " * short-circuit then skipped the reset and the controller never" + NL +
++    T + T + " * generated IRQs again. Always re-init on unblank (stock does a" + NL +
++    T + T + " * firmware download on every resume as well)." + NL +
++    T + T + " */" + NL +
++    T + T + "if (bTouchIsAwake)" + NL +
++    T + T + T + "pr_err(\"[%s] %s %d: awake flag set, re-initialising anyway\\n\"," + NL +
++    T + T + T + CONT + "\"NVT-ts\", \"nvt_ts_resume\", 3183);" + NL
++)
++
++src = open(P).read()
++if "awake flag set, re-initialising anyway" in src:
++    raise SystemExit("already patched")
++assert src.count(OLD) == 1, "unblank short-circuit anchor x%d" % src.count(OLD)
++open(P + ".orig", "w").write(src)
++open(P, "w").write(src.replace(OLD, NEW))
++print("patched", P)
+diff --git a/tb371fc/scripts/p220-dsc-mode-clock-consistent.py b/tb371fc/scripts/p220-dsc-mode-clock-consistent.py
+new file mode 100755
+index 000000000..2943d5cfa
+--- /dev/null
++++ b/tb371fc/scripts/p220-dsc-mode-clock-consistent.py
+@@ -0,0 +1,148 @@
++#!/usr/bin/env python3
++"""p220 - make the DRM mode clock consistent with htotal/vtotal/refresh.
++
++TB371FC's panel is dual-DSI + DSC. dsi_convert_to_drm_mode() used to put the
++DSC-aware per-link pixel clock (375888 kHz) into drm_mode->clock while
++htotal/vtotal are full-frame values. Userspace derives the refresh rate from
++clock/(htotal*vtotal), so KWin reported 52.54/56.70/26.27 Hz although the
++panel really runs at 120/144/60 Hz (144.1 Hz measured via WAIT_VBLANK).
++
++Now the DRM clock is computed from the timings, and convert_to_dsi_mode()
++maps the DRM mode back onto the cached panel mode (same h/v/refresh) to keep
++the DSC-aware pixel clock used by mode matching and bit clock lookup.
++dsi_drm_find_bit_clk_rate() no longer requires the DRM clock to equal the
++cached pixel clock (it never will again for DSC modes).
++"""
++P = "/opt/kernel-tb371fc/techpack/display/msm/dsi/dsi_drm.c"
++NL = chr(10)
++T = chr(9)
++
++src = open(P).read()
++if "TB371FC: the DRM mode clock is derived from htotal" in src:
++    raise SystemExit("already patched")
++
++# ---- 1) signature ----
++OLD_SIG = (
++    "static void convert_to_dsi_mode(const struct drm_display_mode *drm_mode," + NL +
++    T + T + T + T + "struct dsi_display_mode *dsi_mode)"
++)
++NEW_SIG = (
++    "static void convert_to_dsi_mode(struct dsi_display *display," + NL +
++    T + T + T + T + "const struct drm_display_mode *drm_mode," + NL +
++    T + T + T + T + "struct dsi_display_mode *dsi_mode)"
++)
++assert src.count(OLD_SIG) == 1, "signature anchor x%d" % src.count(OLD_SIG)
++src = src.replace(OLD_SIG, NEW_SIG, 1)
++
++# ---- 2) body: canonical pixel clock ----
++OLD_BODY = (
++    T + "dsi_mode->timing.refresh_rate = drm_mode->vrefresh;" + NL +
++    NL +
++    T + "dsi_mode->pixel_clk_khz = drm_mode->clock;" + NL +
++    NL +
++    T + "dsi_mode->priv_info =" + NL +
++    T + T + "(struct dsi_display_mode_priv_info *)drm_mode->private;" + NL +
++    NL +
++    T + "if (dsi_mode->priv_info) {" + NL +
++    T + T + "dsi_mode->timing.dsc_enabled = dsi_mode->priv_info->dsc_enabled;" + NL +
++    T + T + "dsi_mode->timing.dsc = &dsi_mode->priv_info->dsc;" + NL +
++    T + "}"
++)
++NEW_BODY = (
++    T + "dsi_mode->timing.refresh_rate = drm_mode->vrefresh;" + NL +
++    NL +
++    T + "dsi_mode->priv_info =" + NL +
++    T + T + "(struct dsi_display_mode_priv_info *)drm_mode->private;" + NL +
++    NL +
++    T + "if (dsi_mode->priv_info) {" + NL +
++    T + T + "dsi_mode->timing.dsc_enabled = dsi_mode->priv_info->dsc_enabled;" + NL +
++    T + T + "dsi_mode->timing.dsc = &dsi_mode->priv_info->dsc;" + NL +
++    T + "}" + NL +
++    NL +
++    T + "/*" + NL +
++    T + " * TB371FC: the DRM mode clock is derived from htotal/vtotal/refresh" + NL +
++    T + " * (see dsi_convert_to_drm_mode), while the cached panel modes keep" + NL +
++    T + " * the DSC-aware pixel clock. Map the DRM mode back onto the cached" + NL +
++    T + " * entry so mode matching and bit clock lookup keep working." + NL +
++    T + " */" + NL +
++    T + "dsi_mode->pixel_clk_khz = drm_mode->clock;" + NL +
++    T + "if (display && display->modes) {" + NL +
++    T + T + "u32 i, count = 0;" + NL +
++    NL +
++    T + T + "dsi_display_get_mode_count(display, &count);" + NL +
++    T + T + "for (i = 0; i < count; i++) {" + NL +
++    T + T + T + "struct dsi_display_mode *m = &display->modes[i];" + NL +
++    NL +
++    T + T + T + "if (m->timing.v_active == dsi_mode->timing.v_active &&" + NL +
++    T + T + T + T + "m->timing.h_active == dsi_mode->timing.h_active &&" + NL +
++    T + T + T + T + "m->timing.refresh_rate ==" + NL +
++    T + T + T + T + T + "dsi_mode->timing.refresh_rate) {" + NL +
++    T + T + T + T + "dsi_mode->pixel_clk_khz = m->pixel_clk_khz;" + NL +
++    T + T + T + T + "break;" + NL +
++    T + T + T + "}" + NL +
++    T + T + "}" + NL +
++    T + "}"
++)
++assert src.count(OLD_BODY) == 1, "body anchor x%d" % src.count(OLD_BODY)
++src = src.replace(OLD_BODY, NEW_BODY, 1)
++
++# ---- 3) call sites ----
++OLD_CALL1 = T + "convert_to_dsi_mode(adjusted_mode, &(c_bridge->dsi_mode));"
++NEW_CALL1 = T + "convert_to_dsi_mode(c_bridge->display, adjusted_mode," + NL + \
++            T + T + T + T + "&(c_bridge->dsi_mode));"
++assert src.count(OLD_CALL1) == 1, "call1 x%d" % src.count(OLD_CALL1)
++src = src.replace(OLD_CALL1, NEW_CALL1, 1)
++
++n = src.count("convert_to_dsi_mode(mode, &dsi_mode);")
++assert n == 2, "mode calls x%d" % n
++src = src.replace("convert_to_dsi_mode(mode, &dsi_mode);",
++                  "convert_to_dsi_mode(display, mode, &dsi_mode);")
++
++OLD_CALL2 = T + T + "convert_to_dsi_mode(cur_mode, &cur_dsi_mode);"
++NEW_CALL2 = T + T + "convert_to_dsi_mode(display, cur_mode, &cur_dsi_mode);"
++assert src.count(OLD_CALL2) == 1, "cur call x%d" % src.count(OLD_CALL2)
++src = src.replace(OLD_CALL2, NEW_CALL2, 1)
++
++n = src.count("convert_to_dsi_mode(drm_mode, &dsi_mode);")
++assert n == 2, "drm calls x%d" % n
++src = src.replace("convert_to_dsi_mode(drm_mode, &dsi_mode);",
++                  "convert_to_dsi_mode(display, drm_mode, &dsi_mode);")
++
++# ---- 4) DRM clock from timings ----
++OLD_CLK = (
++    T + "drm_mode->vrefresh = dsi_mode->timing.refresh_rate;" + NL +
++    T + "drm_mode->clock = dsi_mode->pixel_clk_khz;"
++)
++NEW_CLK = (
++    T + "drm_mode->vrefresh = dsi_mode->timing.refresh_rate;" + NL +
++    T + "/*" + NL +
++    T + " * TB371FC: report a clock consistent with htotal/vtotal/refresh." + NL +
++    T + " * The DSC-aware pixel clock is not a full-frame clock, so" + NL +
++    T + " * userspace derived 52/57 Hz (120/144 Hz timing) and 26 Hz" + NL +
++    T + " * (60 Hz timing) from it. sde only uses mode->clock for line" + NL +
++    T + " * time estimates, the DSI timing itself stays unchanged." + NL +
++    T + " */" + NL +
++    T + "drm_mode->clock = div_u64((u64)drm_mode->htotal * drm_mode->vtotal *" + NL +
++    T + T + T + "dsi_mode->timing.refresh_rate, 1000);"
++)
++assert src.count(OLD_CLK) == 1, "clock anchor x%d" % src.count(OLD_CLK)
++src = src.replace(OLD_CLK, NEW_CLK, 1)
++
++# ---- 5) bit clock lookup must not compare clock ----
++OLD_LOOKUP = (
++    T + T + "if ((dsi_mode->timing.v_active == drm_mode->vdisplay) &&" + NL +
++    T + T + "    (dsi_mode->timing.h_active == drm_mode->hdisplay) &&" + NL +
++    T + T + "    (dsi_mode->pixel_clk_khz == drm_mode->clock) &&" + NL +
++    T + T + "    (dsi_mode->timing.refresh_rate == drm_mode->vrefresh)) {"
++)
++NEW_LOOKUP = (
++    T + T + "if ((dsi_mode->timing.v_active == drm_mode->vdisplay) &&" + NL +
++    T + T + "    (dsi_mode->timing.h_active == drm_mode->hdisplay) &&" + NL +
++    T + T + "    (dsi_mode->timing.refresh_rate == drm_mode->vrefresh)) {"
++)
++assert src.count(OLD_LOOKUP) == 1, "lookup anchor x%d" % src.count(OLD_LOOKUP)
++src = src.replace(OLD_LOOKUP, NEW_LOOKUP, 1)
++
++open(P + ".pre-p220", "w").write(open(P).read())
++open(P, "w").write(src)
++print("patched", P)
+diff --git a/techpack/Kbuild b/techpack/Kbuild
+index d5f247d78..a97009d56 100644
+--- a/techpack/Kbuild
++++ b/techpack/Kbuild
+@@ -2,7 +2,15 @@
+ TECHPACK?=y
+ 
+ techpack-dirs := $(shell find $(srctree)/techpack -maxdepth 1 -mindepth 1 -type d -not -name ".*")
+-obj-${TECHPACK} += stub/ $(addsuffix /,$(subst $(srctree)/techpack/,,$(techpack-dirs)))
++ifeq ($(CONFIG_DRM_MSM),y)
++obj-y += display/
++else
++obj-y += stub/
++endif
+ 
+ techpack-header-dirs := $(shell find $(srctree)/techpack -maxdepth 1 -mindepth 1 -type d -not -name ".*")
+ header-${TECHPACK} += $(addsuffix /include/uapi/,$(subst $(srctree)/techpack/,,$(techpack-header-dirs)))
++
++ifeq ($(CONFIG_ARCH_KONA),y)
++obj-y += audio/
++endif
+diff --git a/techpack/audio/asoc/codecs/tfa98xx/src/tfa98xx.c b/techpack/audio/asoc/codecs/tfa98xx/src/tfa98xx.c
+index fc50e6c28..638c14f04 100755
+--- a/techpack/audio/asoc/codecs/tfa98xx/src/tfa98xx.c
++++ b/techpack/audio/asoc/codecs/tfa98xx/src/tfa98xx.c
+@@ -87,28 +87,6 @@ static int tfa98xx_ftrace_regs = 0;
+ 
+ static char *fw_name = "tfa98xx_QS.cnt"; /* p247: TB371FC vendor container */
+ 
+-/* p249: sync-preload the container from /vendor/firmware into the kernel
+- * firmware cache, so the later request_firmware() (which fires long after
+- * the ueventd fallback window on this device) is served from cache. */
+-static int __init p249_preload_container(void)
+-{
+-	const struct firmware *fw = NULL;
+-	int rc;
+-
+-	rc = request_firmware(&fw, fw_name, NULL);
+-	if (rc == 0 && fw) {
+-		pr_info("p249: preloaded %s (%zu bytes) into fw cache\n",
+-			fw_name, fw->size);
+-		release_firmware(fw);
+-		/* request_firmware caches until release; re-request later
+-		 * hits the cache. To persist across the early probe we rely
+-		 * on the cache holding the entry until the consumer loads. */
+-	} else {
+-		pr_info("p249: preload rc=%d (vendor fs not mounted yet)\n", rc);
+-	}
+-	return 0;
+-}
+-late_initcall_sync(p249_preload_container);
+ 
+ module_param(fw_name, charp, S_IRUGO | S_IWUSR);
+ MODULE_PARM_DESC(fw_name, "TFA98xx DSP firmware (container file) name.");
+@@ -212,7 +190,7 @@ const struct snd_kcontrol_new nxp_spk_id_controls[] ={
+ 	SOC_ENUM_EXT("SPK ID", nxp_vendor_id, nxp_vendor_id_get, NULL),
+ };
+ 
+-static int tfa9894_info_chan_sel_ctl(struct snd_kcontrol *kcontrol,
++static int __maybe_unused tfa9894_info_chan_sel_ctl(struct snd_kcontrol *kcontrol,
+ 				struct snd_ctl_elem_info *uinfo)
+ {
+ 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+@@ -2007,7 +1985,6 @@ static int tfa98xx_append_i2c_address(struct device *dev,
+ {
+ 	char buf[50];
+ 	int i;
+-	int i2cbus = i2c->adapter->nr;
+ 	int addr = i2c->addr;
+ 	if (dai_drv && num_dai > 0)
+ 		for(i = 0; i < num_dai; i++) {
+diff --git a/techpack/audio/asoc/codecs/tfa98xx/src/tfa_dsp.c b/techpack/audio/asoc/codecs/tfa98xx/src/tfa_dsp.c
+index 80ba612c1..e54573a42 100755
+--- a/techpack/audio/asoc/codecs/tfa98xx/src/tfa_dsp.c
++++ b/techpack/audio/asoc/codecs/tfa98xx/src/tfa_dsp.c
+@@ -3049,18 +3049,23 @@ enum tfa_error tfa_dev_start(struct tfa_device *tfa, int next_profile, int vstep
+ 		 * amplifier enters operating state.  This is only for the direct
+ 		 * I2C TFA9894 path and mirrors the stock module. */
+ 		{
+-			int sel = tfa9894_get_store_chan_sel();
+-			int spks = 0;
+-			int dcs = 0;
+ 			char *profile_name =
+ 				tfaContProfileName(tfa->cnt, tfa->dev_idx, next_profile);
++			char *dev_name =
++				tfaContDeviceName(tfa->cnt, tfa->dev_idx);
+ 
+-			if ((sel != -1) && ((tfa->rev & 0xff) == 0x94) &&
++			if (((tfa->rev & 0xff) == 0x94) &&
+ 			    (profile_name != NULL) &&
+ 			    (strstr(profile_name, "nonRotation") == NULL)) {
+-				if (tfa9894_get_target_chan_sel(sel, tfa->dev_idx,
+-								&spks, &dcs) == 0)
+-					tfa9894_change_chan_sel(tfa, spks, dcs);
++				int side = (dev_name &&
++					    strstr(dev_name, "_r")) ? 1 : 0;
++
++				/* TB371FC Linux stereo layout: left amps take
++				 * TDM slot 0, right amps take TDM slot 1.  The
++				 * stock rotation selectors assume four slots of
++				 * spatial audio; the Linux BE carries stereo.
++				 */
++				tfa9894_change_chan_sel(tfa, side, side);
+ 			}
+ 		}
+ 		/* Make sure internal oscillator is running for DSP devices (non-dsp and max1 this is no-op) */
+diff --git a/techpack/audio/asoc/kona.c b/techpack/audio/asoc/kona.c
+index 62a5bd685..274bcf0bc 100644
+--- a/techpack/audio/asoc/kona.c
++++ b/techpack/audio/asoc/kona.c
+@@ -5411,7 +5411,7 @@ static struct snd_soc_ops msm_cdc_dma_be_ops = {
+ 	.hw_params = msm_snd_cdc_dma_hw_params,
+ };
+ 
+-static struct snd_soc_ops msm_wcn_ops = {
++static struct snd_soc_ops __maybe_unused msm_wcn_ops = {
+ 	.hw_params = msm_wcn_hw_params,
+ };
+ 
+@@ -5519,7 +5519,7 @@ static const struct snd_soc_dapm_widget msm_int_dapm_widgets[] = {
+ 	SND_SOC_DAPM_MIC("Digital Mic7", NULL),
+ };
+ 
+-static int msm_wcn_init(struct snd_soc_pcm_runtime *rtd)
++static int __maybe_unused msm_wcn_init(struct snd_soc_pcm_runtime *rtd)
+ {
+ 	unsigned int rx_ch[WCN_CDC_SLIM_RX_CH_MAX] = {157, 158};
+ 	unsigned int tx_ch[WCN_CDC_SLIM_TX_CH_MAX]  = {159, 160};
+@@ -6751,44 +6751,6 @@ static struct snd_soc_dai_link msm_tdm_be_dai_links[] = {
+ 	},
+ };
+ 
+-static struct snd_soc_dai_link msm_wcn_be_dai_links[] = {
+-	{
+-		.name = LPASS_BE_SLIMBUS_7_RX,
+-		.stream_name = "Slimbus7 Playback",
+-		.cpu_dai_name = "msm-dai-q6-dev.16398",
+-		.platform_name = "msm-pcm-routing",
+-		.codec_name = "btfmslim_slave",
+-		/* BT codec driver determines capabilities based on
+-		 * dai name, bt codecdai name should always contains
+-		 * supported usecase information
+-		 */
+-		.codec_dai_name = "btfm_bt_sco_a2dp_slim_rx",
+-		.no_pcm = 1,
+-		.dpcm_playback = 1,
+-		.id = MSM_BACKEND_DAI_SLIMBUS_7_RX,
+-		.be_hw_params_fixup = msm_be_hw_params_fixup,
+-		.init = &msm_wcn_init,
+-		.ops = &msm_wcn_ops,
+-		/* dai link has playback support */
+-		.ignore_pmdown_time = 1,
+-		.ignore_suspend = 1,
+-	},
+-	{
+-		.name = LPASS_BE_SLIMBUS_7_TX,
+-		.stream_name = "Slimbus7 Capture",
+-		.cpu_dai_name = "msm-dai-q6-dev.16399",
+-		.platform_name = "msm-pcm-routing",
+-		.codec_name = "btfmslim_slave",
+-		.codec_dai_name = "btfm_bt_sco_slim_tx",
+-		.no_pcm = 1,
+-		.dpcm_capture = 1,
+-		.id = MSM_BACKEND_DAI_SLIMBUS_7_TX,
+-		.be_hw_params_fixup = msm_be_hw_params_fixup,
+-		.ops = &msm_wcn_ops,
+-		.ignore_suspend = 1,
+-	},
+-};
+-
+ static struct snd_soc_dai_link msm_wcn_btfm_be_dai_links[] = {
+ 	{
+ 		.name = LPASS_BE_SLIMBUS_7_RX,
+@@ -7449,7 +7411,6 @@ static struct snd_soc_dai_link msm_kona_dai_links[
+ 			ARRAY_SIZE(msm_rx_tx_cdc_dma_be_dai_links) +
+ 			ARRAY_SIZE(msm_va_cdc_dma_be_dai_links) +
+ 			ARRAY_SIZE(ext_disp_be_dai_link) +
+-			ARRAY_SIZE(msm_wcn_be_dai_links) +
+ 			ARRAY_SIZE(msm_afe_rxtx_lb_be_dai_link) +
+ 			ARRAY_SIZE(msm_wcn_btfm_be_dai_links) +
+ 			ARRAY_SIZE(msm_tdm_be_dai_links)];
+@@ -7749,15 +7710,10 @@ static struct snd_soc_card *populate_snd_card_dailinks(struct device *dev)
+ 			total_links += ARRAY_SIZE(ext_disp_be_dai_link);
+ 		}
+ 
+-		rc = of_property_read_u32(dev->of_node, "qcom,wcn-bt", &val);
+-		if (!rc && val) {
+-			dev_dbg(dev, "%s(): WCN BT support present\n",
+-				__func__);
+-			memcpy(msm_kona_dai_links + total_links,
+-			       msm_wcn_be_dai_links,
+-			       sizeof(msm_wcn_be_dai_links));
+-			total_links += ARRAY_SIZE(msm_wcn_be_dai_links);
+-		}
++		/* TB371FC has no SLIMbus WCN BT codec (BT is QCA6390 over
++		 * UART), so the btfmslim DAI links would keep the whole card
++		 * from registering.  Skip them.
++		 */
+ 
+ 		rc = of_property_read_u32(dev->of_node, "qcom,afe-rxtx-lb",
+ 				&val);
+diff --git a/techpack/audio/dsp/adsp-loader.c b/techpack/audio/dsp/adsp-loader.c
+index a32acfd35..7bbac2a66 100644
+--- a/techpack/audio/dsp/adsp-loader.c
++++ b/techpack/audio/dsp/adsp-loader.c
+@@ -465,6 +465,27 @@ wqueue:
+ 
+ }
+ 
++/*
++ * TB371FC: late userspace is far too slow to reach a systemd unit before the
++ * 30 s deferred-probe deadline, and audio child devices are only created once
++ * ADSP is up.  Kick the ADSP from a delayed work after rootfs and /lib/firmware
++ * are available, but well before that deadline.
++ */
++static void adsp_loader_auto_boot(struct work_struct *work)
++{
++	if (adsp_private)
++		adsp_load_fw(NULL);
++}
++
++static DECLARE_DELAYED_WORK(adsp_boot_work, adsp_loader_auto_boot);
++
++static int __init adsp_loader_auto_boot_init(void)
++{
++	schedule_delayed_work(&adsp_boot_work, msecs_to_jiffies(8000));
++	return 0;
++}
++late_initcall_sync(adsp_loader_auto_boot_init);
++
+ static const struct of_device_id adsp_loader_dt_match[] = {
+ 	{ .compatible = "qcom,adsp-loader" },
+ 	{ }
+diff --git a/techpack/audio/include/soc/internal.h b/techpack/audio/include/soc/internal.h
+index e517781e4..2bc065526 120000
+--- a/techpack/audio/include/soc/internal.h
++++ b/techpack/audio/include/soc/internal.h
+@@ -1 +1 @@
+-/home/smith/kernels/tb371fc/android_kernel_lenovo_tb371fc/drivers/base/regmap/internal.h
+\ No newline at end of file
++../../../../drivers/base/regmap/internal.h
+\ No newline at end of file
+diff --git a/techpack/audio/soc/core.h b/techpack/audio/soc/core.h
+index faa932ca8..8a2fa90df 120000
+--- a/techpack/audio/soc/core.h
++++ b/techpack/audio/soc/core.h
+@@ -1 +1 @@
+-/home/smith/kernels/tb371fc/android_kernel_lenovo_tb371fc/drivers/pinctrl/core.h
+\ No newline at end of file
++../../../drivers/pinctrl/core.h
+\ No newline at end of file
+diff --git a/techpack/audio/soc/pinctrl-lpi.c b/techpack/audio/soc/pinctrl-lpi.c
+index ec075e828..725e9b644 100644
+--- a/techpack/audio/soc/pinctrl-lpi.c
++++ b/techpack/audio/soc/pinctrl-lpi.c
+@@ -789,6 +789,31 @@ static int lpi_pinctrl_probe(struct platform_device *pdev)
+ 		goto err_range;
+ 	}
+ 
++	/* The vote clock providers are siblings created after this node;
++	 * defer instead of dropping the clocks, otherwise every LPI GPIO
++	 * write fails with "core hw vote clk is not enabled".
++	 */
++	lpass_core_hw_vote = devm_clk_get(&pdev->dev, "lpass_core_hw_vote");
++	if (IS_ERR(lpass_core_hw_vote)) {
++		ret = PTR_ERR(lpass_core_hw_vote);
++		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
++			__func__, "lpass_core_hw_vote", ret);
++		if (ret == -EPROBE_DEFER)
++			goto err_range;
++		lpass_core_hw_vote = NULL;
++		ret = 0;
++	}
++	lpass_audio_hw_vote = devm_clk_get(&pdev->dev, "lpass_audio_hw_vote");
++	if (IS_ERR(lpass_audio_hw_vote)) {
++		ret = PTR_ERR(lpass_audio_hw_vote);
++		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
++			__func__, "lpass_audio_hw_vote", ret);
++		if (ret == -EPROBE_DEFER)
++			goto err_range;
++		lpass_audio_hw_vote = NULL;
++		ret = 0;
++	}
++
+ 	lpi_dev = &pdev->dev;
+ 	lpi_dev_up = true;
+ 	ret = audio_notifier_register("lpi_tlmm", AUDIO_NOTIFIER_ADSP_DOMAIN,
+@@ -808,32 +833,13 @@ static int lpi_pinctrl_probe(struct platform_device *pdev)
+ 		goto err_snd_evt;
+ 	}
+ 
+-	/* Register LPASS core hw vote */
+-	lpass_core_hw_vote = devm_clk_get(&pdev->dev, "lpass_core_hw_vote");
+-	if (IS_ERR(lpass_core_hw_vote)) {
+-		ret = PTR_ERR(lpass_core_hw_vote);
+-		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
+-			__func__, "lpass_core_hw_vote", ret);
+-		lpass_core_hw_vote = NULL;
+-		ret = 0;
+-	}
+-	state->lpass_core_hw_vote = lpass_core_hw_vote;
+-
+-	/* Register LPASS audio hw vote */
+-	lpass_audio_hw_vote = devm_clk_get(&pdev->dev, "lpass_audio_hw_vote");
+-	if (IS_ERR(lpass_audio_hw_vote)) {
+-		ret = PTR_ERR(lpass_audio_hw_vote);
+-		dev_dbg(&pdev->dev, "%s: clk get %s failed %d\n",
+-			__func__, "lpass_audio_hw_vote", ret);
+-		lpass_audio_hw_vote = NULL;
+-		ret = 0;
+-	}
+-	state->lpass_audio_hw_vote = lpass_audio_hw_vote;
+ 
+ 	state->core_hw_vote_status = false;
+ 	pm_runtime_set_autosuspend_delay(&pdev->dev, LPI_AUTO_SUSPEND_DELAY);
+ 	pm_runtime_use_autosuspend(&pdev->dev);
+ 	pm_runtime_set_suspended(&pdev->dev);
++	state->lpass_core_hw_vote = lpass_core_hw_vote;
++	state->lpass_audio_hw_vote = lpass_audio_hw_vote;
+ 	pm_runtime_enable(&pdev->dev);
+ 
+ 	return 0;
+diff --git a/techpack/audio/soc/pinctrl-utils.h b/techpack/audio/soc/pinctrl-utils.h
+index 2a4c3dd09..9aab5f24b 120000
+--- a/techpack/audio/soc/pinctrl-utils.h
++++ b/techpack/audio/soc/pinctrl-utils.h
+@@ -1 +1 @@
+-/home/smith/kernels/tb371fc/android_kernel_lenovo_tb371fc/drivers/pinctrl/pinctrl-utils.h
+\ No newline at end of file
++../../../drivers/pinctrl/pinctrl-utils.h
+\ No newline at end of file
+diff --git a/techpack/camera/config/konacamera.conf b/techpack/camera/config/konacamera.conf
+index 9b08bcb80..3589f43f5 100644
+--- a/techpack/camera/config/konacamera.conf
++++ b/techpack/camera/config/konacamera.conf
+@@ -1 +1 @@
+-export CONFIG_SPECTRA_CAMERA=y
+\ No newline at end of file
++export CONFIG_SPECTRA_CAMERA=n
+\ No newline at end of file
+diff --git a/techpack/display/Makefile b/techpack/display/Makefile
+index b2829628f..9e0c356bb 100644
+--- a/techpack/display/Makefile
++++ b/techpack/display/Makefile
+@@ -26,5 +26,5 @@ LINUXINCLUDE    += -include $(srctree)/techpack/display/config/bengaldispconf.h
+ endif
+ 
+ obj-$(CONFIG_DRM_MSM) += msm/
+-obj-$(CONFIG_MSM_SDE_ROTATOR) += rotator/
++# disabled for TB371FC display bring-up
+ obj-$(CONFIG_QCOM_MDSS_PLL) += pll/
+diff --git a/techpack/display/msm/Makefile b/techpack/display/msm/Makefile
+index 7dde93091..6f13fab57 100644
+--- a/techpack/display/msm/Makefile
++++ b/techpack/display/msm/Makefile
+@@ -120,3 +120,4 @@ msm_drm-$(CONFIG_DRM_MSM) += \
+ obj-$(CONFIG_DRM_MSM)	+= msm_drm.o
+ 
+ obj-$(CONFIG_DRM_FBDEV_EMULATION) += msm_fbdev.o
++obj-$(CONFIG_DRM_MSM) += tb371fc_earlydump.o
+diff --git a/techpack/display/msm/dsi/dsi_display.c b/techpack/display/msm/dsi/dsi_display.c
+index 35ce0f079..ba16dfc3f 100644
+--- a/techpack/display/msm/dsi/dsi_display.c
++++ b/techpack/display/msm/dsi/dsi_display.c
+@@ -7726,7 +7726,10 @@ int dsi_display_enable(struct dsi_display *display)
+ 	/* Block sending pps command if modeset is due to fps difference */
+ 	if ((mode->priv_info->dsc_enabled) &&
+ 			!(mode->dsi_mode_flags & DSI_MODE_FLAG_DMS_FPS)) {
+-		mode->priv_info->dsc.pic_width *= display->ctrl_count;
++		mode->priv_info->dsc.pic_width = mode->timing.h_active;
++		pr_err("tb371fc-pps2 h_active=%d ctrl_count=%d pic_width=%d\n",
++		       mode->timing.h_active, display->ctrl_count,
++		       mode->priv_info->dsc.pic_width);
+ 		rc = dsi_panel_update_pps(display->panel);
+ 		if (rc) {
+ 			DSI_ERR("[%s] panel pps cmd update failed, rc=%d\n",
+diff --git a/techpack/display/msm/dsi/dsi_drm.c b/techpack/display/msm/dsi/dsi_drm.c
+index f78dd860c..690e7fd57 100644
+--- a/techpack/display/msm/dsi/dsi_drm.c
++++ b/techpack/display/msm/dsi/dsi_drm.c
+@@ -36,7 +36,8 @@ static struct dsi_display_mode_priv_info default_priv_info = {
+ #define WAIT_RESUME_TIMEOUT 200
+ 
+ 
+-static void convert_to_dsi_mode(const struct drm_display_mode *drm_mode,
++static void convert_to_dsi_mode(struct dsi_display *display,
++				const struct drm_display_mode *drm_mode,
+ 				struct dsi_display_mode *dsi_mode)
+ {
+ 	memset(dsi_mode, 0, sizeof(*dsi_mode));
+@@ -59,8 +60,6 @@ static void convert_to_dsi_mode(const struct drm_display_mode *drm_mode,
+ 
+ 	dsi_mode->timing.refresh_rate = drm_mode->vrefresh;
+ 
+-	dsi_mode->pixel_clk_khz = drm_mode->clock;
+-
+ 	dsi_mode->priv_info =
+ 		(struct dsi_display_mode_priv_info *)drm_mode->private;
+ 
+@@ -69,6 +68,30 @@ static void convert_to_dsi_mode(const struct drm_display_mode *drm_mode,
+ 		dsi_mode->timing.dsc = &dsi_mode->priv_info->dsc;
+ 	}
+ 
++	/*
++	 * TB371FC: the DRM mode clock is derived from htotal/vtotal/refresh
++	 * (see dsi_convert_to_drm_mode), while the cached panel modes keep
++	 * the DSC-aware pixel clock. Map the DRM mode back onto the cached
++	 * entry so mode matching and bit clock lookup keep working.
++	 */
++	dsi_mode->pixel_clk_khz = drm_mode->clock;
++	if (display && display->modes) {
++		u32 i, count = 0;
++
++		dsi_display_get_mode_count(display, &count);
++		for (i = 0; i < count; i++) {
++			struct dsi_display_mode *m = &display->modes[i];
++
++			if (m->timing.v_active == dsi_mode->timing.v_active &&
++				m->timing.h_active == dsi_mode->timing.h_active &&
++				m->timing.refresh_rate ==
++					dsi_mode->timing.refresh_rate) {
++				dsi_mode->pixel_clk_khz = m->pixel_clk_khz;
++				break;
++			}
++		}
++	}
++
+ 	if (msm_is_mode_seamless(drm_mode))
+ 		dsi_mode->dsi_mode_flags |= DSI_MODE_FLAG_SEAMLESS;
+ 	if (msm_is_mode_dynamic_fps(drm_mode))
+@@ -118,7 +141,15 @@ void dsi_convert_to_drm_mode(const struct dsi_display_mode *dsi_mode,
+ 	drm_mode->vtotal = drm_mode->vsync_end + dsi_mode->timing.v_back_porch;
+ 
+ 	drm_mode->vrefresh = dsi_mode->timing.refresh_rate;
+-	drm_mode->clock = dsi_mode->pixel_clk_khz;
++	/*
++	 * TB371FC: report a clock consistent with htotal/vtotal/refresh.
++	 * The DSC-aware pixel clock is not a full-frame clock, so
++	 * userspace derived 52/57 Hz (120/144 Hz timing) and 26 Hz
++	 * (60 Hz timing) from it. sde only uses mode->clock for line
++	 * time estimates, the DSI timing itself stays unchanged.
++	 */
++	drm_mode->clock = div_u64((u64)drm_mode->htotal * drm_mode->vtotal *
++			dsi_mode->timing.refresh_rate, 1000);
+ 
+ 	drm_mode->private = (int *)dsi_mode->priv_info;
+ 
+@@ -337,7 +368,8 @@ static void dsi_bridge_mode_set(struct drm_bridge *bridge,
+ 	}
+ 
+ 	memset(&(c_bridge->dsi_mode), 0x0, sizeof(struct dsi_display_mode));
+-	convert_to_dsi_mode(adjusted_mode, &(c_bridge->dsi_mode));
++	convert_to_dsi_mode(c_bridge->display, adjusted_mode,
++				&(c_bridge->dsi_mode));
+ 
+ 	/* restore bit_clk_rate also for dynamic clk use cases */
+ 	c_bridge->dsi_mode.timing.clk_rate_hz =
+@@ -380,7 +412,7 @@ static bool dsi_bridge_mode_fixup(struct drm_bridge *bridge,
+ 		return true;
+ 	}
+ 
+-	convert_to_dsi_mode(mode, &dsi_mode);
++	convert_to_dsi_mode(display, mode, &dsi_mode);
+ 
+ 	/*
+ 	 * retrieve dsi mode from dsi driver's cache since not safe to take
+@@ -407,7 +439,7 @@ static bool dsi_bridge_mode_fixup(struct drm_bridge *bridge,
+ 			crtc_state->crtc) {
+ 		const struct drm_display_mode *cur_mode =
+ 				&crtc_state->crtc->state->mode;
+-		convert_to_dsi_mode(cur_mode, &cur_dsi_mode);
++		convert_to_dsi_mode(display, cur_mode, &cur_dsi_mode);
+ 		cur_dsi_mode.timing.dsc_enabled =
+ 				dsi_mode.priv_info->dsc_enabled;
+ 		cur_dsi_mode.timing.dsc = &dsi_mode.priv_info->dsc;
+@@ -485,7 +517,6 @@ u64 dsi_drm_find_bit_clk_rate(void *display,
+ 		dsi_mode = &dsi_display->modes[i];
+ 		if ((dsi_mode->timing.v_active == drm_mode->vdisplay) &&
+ 		    (dsi_mode->timing.h_active == drm_mode->hdisplay) &&
+-		    (dsi_mode->pixel_clk_khz == drm_mode->clock) &&
+ 		    (dsi_mode->timing.refresh_rate == drm_mode->vrefresh)) {
+ 			bit_clk_rate = dsi_mode->timing.clk_rate_hz;
+ 			break;
+@@ -506,7 +537,7 @@ int dsi_conn_get_mode_info(struct drm_connector *connector,
+ 	if (!drm_mode || !mode_info)
+ 		return -EINVAL;
+ 
+-	convert_to_dsi_mode(drm_mode, &dsi_mode);
++	convert_to_dsi_mode(display, drm_mode, &dsi_mode);
+ 
+ 	if (!dsi_mode.priv_info)
+ 		return -EINVAL;
+@@ -736,7 +767,7 @@ void dsi_connector_put_modes(struct drm_connector *connector,
+ 		return;
+ 
+ 	list_for_each_entry(drm_mode, &connector->modes, head) {
+-		convert_to_dsi_mode(drm_mode, &dsi_mode);
++		convert_to_dsi_mode(display, drm_mode, &dsi_mode);
+ 		dsi_display_put_mode(display, &dsi_mode);
+ 	}
+ 
+@@ -950,7 +981,7 @@ enum drm_mode_status dsi_conn_mode_valid(struct drm_connector *connector,
+ 		return MODE_ERROR;
+ 	}
+ 
+-	convert_to_dsi_mode(mode, &dsi_mode);
++	convert_to_dsi_mode(display, mode, &dsi_mode);
+ 
+ 	rc = dsi_display_validate_mode(display, &dsi_mode,
+ 			DSI_VALIDATE_FLAG_ALLOW_ADJUST);
+diff --git a/techpack/display/msm/dsi/dsi_panel.c b/techpack/display/msm/dsi/dsi_panel.c
+index a53d6c9a0..f6bb932d5 100644
+--- a/techpack/display/msm/dsi/dsi_panel.c
++++ b/techpack/display/msm/dsi/dsi_panel.c
+@@ -3945,30 +3945,31 @@ int dsi_panel_get_host_cfg_for_mode(struct dsi_panel *panel,
+ }
+ 
+ 
+-int dsi_panel_update_pps(struct dsi_panel *panel)
++static int dsi_panel_tx_pps_locked(struct dsi_panel *panel)
+ {
+ 	int rc = 0;
+ 	struct dsi_panel_cmd_set *set = NULL;
+ 	struct dsi_display_mode_priv_info *priv_info = NULL;
+-	struct dsi_parser_utils *utils = &panel->utils;
+-	int panel_cnt = 0;
+ 
+ 	if (!panel || !panel->cur_mode) {
+ 		DSI_ERR("invalid params\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	mutex_lock(&panel->panel_lock);
+-
+ 	priv_info = panel->cur_mode->priv_info;
+ 
+ 	set = &priv_info->cmd_sets[DSI_CMD_SET_PPS];
+-	rc = utils->read_u32(utils->data, "qcom,mdss-dsi-panel-count",
+-							&panel_cnt);
+-	if (!rc && panel_cnt == 2)
+-		priv_info->dsc.pic_width >>= 1;
+ 
+ 	dsi_dsc_create_pps_buf_cmd(&priv_info->dsc, panel->dsc_pps_cmd, 0);
++	pr_err("tb371fc-pps pic=%dx%d slice=%dx%d bpp=%d bpc=%d chunk=%d spp=%d pktl=%d bppkt=%d eol=%d il=%d\n",
++	       priv_info->dsc.pic_width, priv_info->dsc.pic_height,
++	       priv_info->dsc.slice_width, priv_info->dsc.slice_height,
++	       priv_info->dsc.bpp, priv_info->dsc.bpc,
++	       priv_info->dsc.chunk_size, priv_info->dsc.slice_per_pkt,
++	       priv_info->dsc.pkt_per_line, priv_info->dsc.bytes_per_pkt,
++	       priv_info->dsc.eol_byte_num, priv_info->dsc.initial_lines);
++	print_hex_dump(KERN_ERR, "tb371fc-pps ", DUMP_PREFIX_OFFSET, 16, 1,
++		panel->dsc_pps_cmd + 7, 128, false);
+ 	rc = dsi_panel_create_cmd_packets(panel->dsc_pps_cmd,
+ 					  DSI_CMD_PPS_SIZE, 1, set->cmds);
+ 	if (rc) {
+@@ -3984,6 +3985,20 @@ int dsi_panel_update_pps(struct dsi_panel *panel)
+ 
+ 	dsi_panel_destroy_cmd_packets(set);
+ error:
++	return rc;
++}
++
++int dsi_panel_update_pps(struct dsi_panel *panel)
++{
++	int rc;
++
++	if (!panel || !panel->cur_mode) {
++		DSI_ERR("invalid params\n");
++		return -EINVAL;
++	}
++
++	mutex_lock(&panel->panel_lock);
++	rc = dsi_panel_tx_pps_locked(panel);
+ 	mutex_unlock(&panel->panel_lock);
+ 	return rc;
+ }
+diff --git a/techpack/display/msm/dsi/dsi_phy_hw_v4_0.c b/techpack/display/msm/dsi/dsi_phy_hw_v4_0.c
+index ec6690c3e..a4b399e56 100644
+--- a/techpack/display/msm/dsi/dsi_phy_hw_v4_0.c
++++ b/techpack/display/msm/dsi/dsi_phy_hw_v4_0.c
+@@ -403,6 +403,11 @@ static void dsi_phy_hw_dphy_enable(struct dsi_phy_hw *phy,
+ 	/* Remove power down from all blocks */
+ 	DSI_W32(phy, DSIPHY_CMN_CTRL_0, 0x7f);
+ 
++	pr_err("TB371FC dphy_enable: CTRL0=%08x CFG0=%08x PLLCNTRL=%08x\n",
++	       DSI_R32(phy, DSIPHY_CMN_CTRL_0),
++	       DSI_R32(phy, DSIPHY_CMN_CLK_CFG0),
++	       DSI_R32(phy, DSIPHY_CMN_PLL_CNTRL));
++
+ 	cmn_lane_ctrl0 = dsi_phy_hw_calc_cmn_lane_ctrl0(cfg);
+ 
+ 	DSI_W32(phy, DSIPHY_CMN_LANE_CTRL0, cmn_lane_ctrl0);
+diff --git a/techpack/display/msm/sde/sde_crtc.c b/techpack/display/msm/sde/sde_crtc.c
+index d379d5a5f..514f2448d 100644
+--- a/techpack/display/msm/sde/sde_crtc.c
++++ b/techpack/display/msm/sde/sde_crtc.c
+@@ -6129,10 +6129,31 @@ static void sde_crtc_early_unregister(struct drm_crtc *crtc)
+ 	_sde_crtc_destroy_debugfs(crtc);
+ }
+ 
++/* tb371fc: KWin's legacy modesetting path unconditionally issues
++ * DRM_IOCTL_MODE_CURSOR2 for its hardware-cursor layer. SDE has no cursor
++ * plane and no legacy cursor callbacks, so the core returns -ENXIO and KWin
++ * treats the whole test commit as failed, then crashes on the reverted state.
++ * Accept and ignore the cursor request; KWin is configured to use a software
++ * cursor, so nothing is lost.
++ */
++static int sde_crtc_cursor_set2(struct drm_crtc *crtc,
++		struct drm_file *file_priv, uint32_t handle, uint32_t width,
++		uint32_t height, int32_t hot_x, int32_t hot_y)
++{
++	return 0;
++}
++
++static int sde_crtc_cursor_move(struct drm_crtc *crtc, int x, int y)
++{
++	return 0;
++}
++
+ static const struct drm_crtc_funcs sde_crtc_funcs = {
+ 	.set_config = drm_atomic_helper_set_config,
+ 	.destroy = sde_crtc_destroy,
+ 	.page_flip = drm_atomic_helper_page_flip,
++	.cursor_set2 = sde_crtc_cursor_set2,
++	.cursor_move = sde_crtc_cursor_move,
+ 	.atomic_set_property = sde_crtc_atomic_set_property,
+ 	.atomic_get_property = sde_crtc_atomic_get_property,
+ 	.reset = sde_crtc_reset,
+diff --git a/techpack/display/msm/sde/sde_kms.c b/techpack/display/msm/sde/sde_kms.c
+index 115752040..12a26bcee 100644
+--- a/techpack/display/msm/sde/sde_kms.c
++++ b/techpack/display/msm/sde/sde_kms.c
+@@ -2435,6 +2435,126 @@ static int sde_kms_check_secure_transition(struct msm_kms *kms,
+ 	return 0;
+ }
+ 
++/*
++ * tb371fc: split a full-screen primary plane across the SSPP pair
++ *
++ * The vendor KMS stages a single full-width plane on one SSPP and lets the
++ * layer mixers source-split it. On this dual-DSI/DSC panel that only decodes
++ * the first slice row, the rest of the panel is garbled. The bootloader
++ * instead drives two half-width SSPPs (VIG0 at x=0 and VIG1 at x=half), one
++ * per layer mixer, which renders correctly.
++ *
++ * The vendor KMS does not expose standard atomic plane properties, so
++ * userspace cannot submit the second plane itself. Synthesize it here, before
++ * drm_atomic_helper_check() (and therefore before the encoder resource
++ * reservation), by duplicating the full-screen primary plane onto the paired
++ * SSPP. The primary is shrunk to the left half, the clone covers the right.
++ */
++static int tb371fc_split_wide_plane(struct drm_device *dev,
++		struct drm_atomic_state *state)
++{
++	static bool logged;
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *crtc_state;
++	int i;
++
++	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
++		struct drm_plane_state *pstate, *sstate;
++		struct drm_plane *split = NULL, *p;
++		enum sde_sspp pipe;
++		uint32_t hdisplay, split_x;
++		uint64_t zpos;
++
++		if (!crtc_state->enable || !crtc_state->active)
++			continue;
++
++		pstate = drm_atomic_get_new_plane_state(state, crtc->primary);
++		if (!pstate || !pstate->fb)
++			continue;
++
++		hdisplay = crtc_state->mode.hdisplay;
++		if (hdisplay < 128 || (hdisplay & 1))
++			continue;
++
++		split_x = hdisplay / 2;
++
++		/*
++		 * Only a 1:1, full-screen primary (or one that this helper
++		 * already split in a previous commit) is handled.
++		 */
++		if (pstate->crtc_x != 0 || pstate->crtc_y != 0 ||
++				pstate->src_x != 0)
++			continue;
++		if (pstate->crtc_w != hdisplay && pstate->crtc_w != split_x)
++			continue;
++		if (pstate->src_w != (pstate->crtc_w << 16))
++			continue;
++
++		pipe = sde_plane_pipe(crtc->primary);
++		if (pipe != SSPP_VIG0 && pipe != SSPP_VIG2)
++			continue;
++
++		/* find the SSPP paired with the primary (VIG0->VIG1, ...) */
++		drm_for_each_plane(p, dev) {
++			if (p == crtc->primary || is_sde_plane_virtual(p))
++				continue;
++			if (sde_plane_pipe(p) != pipe + 1)
++				continue;
++			split = p;
++			break;
++		}
++		if (!split)
++			continue;
++
++		sstate = drm_atomic_get_existing_plane_state(state, split);
++		if (sstate && (sstate->crtc != crtc || sstate->fb))
++			continue;	/* pair already in use this commit */
++
++		if (!sstate) {
++			sstate = drm_atomic_get_plane_state(state, split);
++			if (IS_ERR(sstate))
++				return PTR_ERR(sstate);
++		}
++
++		/* primary covers the left mixer from now on */
++		if (pstate->crtc_w != split_x) {
++			pstate->crtc_w = split_x;
++			pstate->src_w = split_x << 16;
++		}
++
++		/* clone the right half onto the paired SSPP */
++		drm_atomic_set_fb_for_plane(sstate, pstate->fb);
++		sstate->crtc_x = split_x;
++		sstate->crtc_y = pstate->crtc_y;
++		sstate->crtc_w = hdisplay - split_x;
++		sstate->crtc_h = pstate->crtc_h;
++		sstate->src_x = split_x << 16;
++		sstate->src_y = pstate->src_y;
++		sstate->src_w = (hdisplay - split_x) << 16;
++		sstate->src_h = pstate->src_h;
++
++		if (drm_atomic_set_crtc_for_plane(sstate, crtc))
++			return -EINVAL;
++
++		/* keep the halves in separate blend stages (no source split) */
++		zpos = sde_plane_get_property(to_sde_plane_state(pstate),
++				PLANE_PROP_ZPOS);
++		if (zpos >= SDE_STAGE_MAX - SDE_STAGE_0 - 1)
++			zpos = 0;
++		sde_plane_set_zpos(split, sstate, zpos + 1);
++
++		if (!logged) {
++			logged = true;
++			pr_info("tb371fc: split plane%d %ux%u into %u + %u\n",
++					crtc->base.id, hdisplay,
++					pstate->crtc_h, split_x,
++					hdisplay - split_x);
++		}
++	}
++
++	return 0;
++}
++
+ static int sde_kms_atomic_check(struct msm_kms *kms,
+ 		struct drm_atomic_state *state)
+ {
+@@ -2455,6 +2575,10 @@ static int sde_kms_atomic_check(struct msm_kms *kms,
+ 		goto end;
+ 	}
+ 
++	ret = tb371fc_split_wide_plane(dev, state);
++	if (ret)
++		goto end;
++
+ 	ret = drm_atomic_helper_check(dev, state);
+ 	if (ret)
+ 		goto end;
+@@ -3406,6 +3530,12 @@ static int _sde_kms_get_splash_data(struct sde_splash_data *data)
+ 
+ 	memset(data, 0, sizeof(*data));
+ 
++	/* TB371FC bring-up: force a cold panel initialisation so the kernel
++	 * sends the DSC PPS itself.
++	 */
++	pr_info("sde: cont_splash disabled by TB371FC bring-up patch");
++	return 0;
++
+ 	parent = of_find_node_by_path("/reserved-memory");
+ 	if (!parent) {
+ 		SDE_ERROR("failed to find reserved-memory node\n");
+diff --git a/techpack/display/msm/sde/sde_plane.c b/techpack/display/msm/sde/sde_plane.c
+index c2e404888..e7fcbba92 100644
+--- a/techpack/display/msm/sde/sde_plane.c
++++ b/techpack/display/msm/sde/sde_plane.c
+@@ -4567,6 +4567,24 @@ bool is_sde_plane_virtual(struct drm_plane *plane)
+ 	return plane ? to_sde_plane(plane)->is_virtual : false;
+ }
+ 
++int sde_plane_set_zpos(struct drm_plane *plane, struct drm_plane_state *state,
++		uint64_t zpos)
++{
++	struct sde_plane *psde;
++	struct sde_plane_state *pstate;
++
++	if (!plane || !state)
++		return -EINVAL;
++
++	psde = to_sde_plane(plane);
++	pstate = to_sde_plane_state(state);
++
++	return msm_property_atomic_set(&psde->property_info,
++			&pstate->property_state,
++			psde->property_info.property_array[PLANE_PROP_ZPOS],
++			zpos);
++}
++
+ /* initialize plane */
+ struct drm_plane *sde_plane_init(struct drm_device *dev,
+ 		uint32_t pipe, bool primary_plane,
+diff --git a/techpack/display/msm/sde/sde_plane.h b/techpack/display/msm/sde/sde_plane.h
+index 316bd75f4..609ab3fd4 100644
+--- a/techpack/display/msm/sde/sde_plane.h
++++ b/techpack/display/msm/sde/sde_plane.h
+@@ -154,6 +154,16 @@ enum sde_sspp sde_plane_pipe(struct drm_plane *plane);
+  */
+ bool is_sde_plane_virtual(struct drm_plane *plane);
+ 
++/**
++ * sde_plane_set_zpos - set zpos property value on a plane state
++ * @plane: Pointer to DRM plane object
++ * @state: Plane state to update
++ * @zpos: New zpos property value
++ * Returns: Zero on success
++ */
++int sde_plane_set_zpos(struct drm_plane *plane, struct drm_plane_state *state,
++		uint64_t zpos);
++
+ /**
+  * sde_plane_ctl_flush - set/clear control flush mask
+  * @plane:   Pointer to DRM plane object
+diff --git a/techpack/display/msm/sde/sde_wb.c b/techpack/display/msm/sde/sde_wb.c
+index 4fcc2c316..ad2d5b93d 100644
+--- a/techpack/display/msm/sde/sde_wb.c
++++ b/techpack/display/msm/sde/sde_wb.c
+@@ -414,7 +414,13 @@ int sde_wb_connector_post_init(struct drm_connector *connector, void *display)
+ 
+ 	c_conn = to_sde_connector(connector);
+ 	wb_dev->connector = connector;
+-	wb_dev->detect_status = connector_status_connected;
++	/*
++	 * tb371fc: the writeback connector is only usable by the vendor's
++	 * custom commit interface; advertising it as connected makes generic
++	 * DRM clients (KWin) create an unusable output and crash while
++	 * assigning output layers. Keep it disconnected; CWB is not used.
++	 */
++	wb_dev->detect_status = connector_status_disconnected;
+ 
+ 	/*
+ 	 * Add extra connector properties
+diff --git a/techpack/display/msm/tb371fc_earlydump.c b/techpack/display/msm/tb371fc_earlydump.c
+new file mode 100755
+index 000000000..de2b16bcd
+--- /dev/null
++++ b/techpack/display/msm/tb371fc_earlydump.c
+@@ -0,0 +1,255 @@
++// SPDX-License-Identifier: GPL-2.0
++/* TB371FC early read-only register capture.
++ *
++ * Runs at early_initcall, i.e. before the mdss/sde platform driver probes and
++ * before the DSI panel is re-initialised by Linux.  At that moment the
++ * bootloader (ABL) continuous-splash pipeline is still live, so this dump is
++ * the ground truth of a *working* DSI/DSC/MDP configuration for this panel.
++ * Compare it against the post-modeset dump taken later by the regpeek module.
++ */
++#include <linux/module.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/jiffies.h>
++#include <linux/ktime.h>
++
++#define SDE_PHYS   0x0ae00000UL
++#define DSI0_PHYS  0x0ae94000UL
++#define DSI1_PHYS  0x0ae96000UL
++#define PHY0_PHYS  0x0ae94400UL
++#define PHY1_PHYS  0x0ae96400UL
++
++static void dump_dsi(const char *n, unsigned long phys)
++{
++	void __iomem *b = ioremap(phys, 0x1000);
++	u32 v, c, st, fifo, vm, ah, av, tot, hsync, vsync, vpos;
++	u32 lane, lane_ctl, phyerr, tout, clk, clkst, comp, comp2;
++
++	if (!b) { pr_err("regpeek: ioremap %s failed\n", n); return; }
++	v = readl(b + 0x000); c = readl(b + 0x004);
++	st = readl(b + 0x008); fifo = readl(b + 0x00c);
++	vm = readl(b + 0x010); ah = readl(b + 0x024);
++	av = readl(b + 0x028); tot = readl(b + 0x02c);
++	hsync = readl(b + 0x030); vsync = readl(b + 0x034);
++	vpos = readl(b + 0x038); lane = readl(b + 0x0a8);
++	lane_ctl = readl(b + 0x0ac); phyerr = readl(b + 0x0b4);
++	tout = readl(b + 0x0c0); clk = readl(b + 0x11c);
++	clkst = readl(b + 0x120);
++	comp = readl(b + 0x2a0); comp2 = readl(b + 0x2a4);
++	pr_err("regpeek %s phys=%08lx ver=%08x ctrl=%08x stat=%08x fifo=%08x vm=%08x ah=%08x av=%08x tot=%08x hsync=%08x vsync=%08x vpos=%08x lane=%08x lanectl=%08x phyerr=%08x tout=%08x clk=%08x clkst=%08x COMP=%08x COMP2=%08x\n",
++	       n, phys, v, c, st, fifo, vm, ah, av, tot, hsync, vsync,
++	       vpos, lane, lane_ctl, phyerr, tout, clk, clkst, comp, comp2);
++	pr_err("regpeek %s misc 018=%08x 01c=%08x 020=%08x 03c=%08x 040=%08x 2a8=%08x 2ac=%08x\n",
++	       n, readl(b + 0x018), readl(b + 0x01c), readl(b + 0x020),
++	       readl(b + 0x03c), readl(b + 0x040), readl(b + 0x2a8),
++	       readl(b + 0x2ac));
++	iounmap(b);
++}
++
++static void dump_phy(const char *n, unsigned long phys)
++{
++	void __iomem *b = ioremap(phys, 0x400);
++	u32 r0, r4, r1c, r20, r24, r28, r2c, r30, r34, r38, r3c, r40;
++	if (!b) { pr_err("regpeek: ioremap %s failed\n", n); return; }
++	r0 = readl(b + 0x000); r4 = readl(b + 0x004);
++	r1c = readl(b + 0x01c); r20 = readl(b + 0x020);
++	r24 = readl(b + 0x024); r28 = readl(b + 0x028);
++	r2c = readl(b + 0x02c); r30 = readl(b + 0x030);
++	r34 = readl(b + 0x034); r38 = readl(b + 0x038);
++	r3c = readl(b + 0x03c); r40 = readl(b + 0x040);
++	pr_err("regpeek %s phys=%08lx rev=%08x glbl=%08x lane0=%08x lane1=%08x lane2=%08x lane3=%08x clk=%08x tm=%08x lpx=%08x hsx=%08x lock=%08x r38=%08x r3c=%08x r40=%08x\n",
++	       n, phys, r0, r4, r1c, r20, r24, r28, r2c, r30, r34, r38, r3c, r40);
++	iounmap(b);
++}
++
++static void dump_dsc(const char *n, unsigned long phys)
++{
++	void __iomem *b = ioremap(phys, 0x100);
++	u32 c, e, p, s, ch, dly, sr;
++	if (!b) { pr_err("regpeek: ioremap %s failed\n", n); return; }
++	c = readl(b + 0x000); e = readl(b + 0x004); p = readl(b + 0x008);
++	s = readl(b + 0x00c); ch = readl(b + 0x010); dly = readl(b + 0x014);
++	sr = readl(b + 0x038);
++	pr_err("regpeek %s phys=%08lx COMMON=%08x ENC=%08x PIC=%08x SLICE=%08x CHUNK=%08x DELAY=%08x RC=%08x\n",
++	       n, phys, c, e, p, s, ch, dly, sr);
++	iounmap(b);
++}
++
++static void dump_blk(const char *n, unsigned long phys, int nreg)
++{
++	void __iomem *b = ioremap(phys, 0x100);
++	int i;
++	if (!b) { pr_err("regpeek: ioremap %s failed\n", n); return; }
++	pr_err("regpeek %s phys=%08lx:", n, phys);
++	for (i = 0; i < nreg; i++)
++		pr_err(" r%02x=%08x", i * 4, readl(b + i * 4));
++	pr_err("\n");
++	iounmap(b);
++}
++
++static void dump_idx(const char *n, unsigned long phys, const int *offs, int cnt)
++{
++	void __iomem *b = ioremap(phys, 0x110);
++	int i;
++	if (!b) { pr_err("regpeek: ioremap %s failed\n", n); return; }
++	pr_err("regpeek %s phys=%08lx", n, phys);
++	for (i = 0; i < cnt; i++)
++		pr_err(" %02x=%08x", offs[i], readl(b + offs[i]));
++	pr_err("\n");
++	iounmap(b);
++}
++
++static void dump_pll(const char *n, unsigned long pll_phys,
++		     unsigned long phy_phys, unsigned long gdsc_phys)
++{
++	void __iomem *p = ioremap(pll_phys, 0x260);
++	void __iomem *h = ioremap(phy_phys, 0x800);
++	void __iomem *g = ioremap(gdsc_phys, 0x10);
++	void __iomem *d = ioremap(pll_phys - 0x700, 0x100);
++	u32 sysmux = 0, status = 0, outdiv = 0, lval = 0, calpha = 0;
++	u32 ctrl0 = 0, cfg0 = 0, cfg1 = 0, ctrl3 = 0, pllctrl = 0;
++	u32 spare4 = 0, gdscr = 0, rbias = 0;
++	u32 dcmode = 0, dctl = 0, ddec = 0, dfrac = 0, doutdiv = 0;
++	u32 fracm = 0, frach = 0;
++
++	if (p) {
++		sysmux = readl(p + 0x028);
++		outdiv = readl(p + 0x0A8);
++		status = readl(p + 0x1B0);
++		lval = readl(p + 0x0CC);
++		calpha = readl(p + 0x0D0);
++		fracm = readl(p + 0x0D4);
++		frach = readl(p + 0x0D8);
++	}
++	if (d) {
++		dcmode = readl(d + 0x030);
++		dctl = readl(d + 0x040);
++		doutdiv = readl(d + 0x0A8);
++		ddec = readl(d + 0x0CC);
++		dfrac = readl(d + 0x0D0);
++	}
++	if (h) {
++		cfg0 = readl(h + 0x010);
++		cfg1 = readl(h + 0x014);
++		ctrl0 = readl(h + 0x024);
++		ctrl3 = readl(h + 0x030);
++		pllctrl = readl(h + 0x03C);
++		spare4 = readl(h + 0x128);
++		rbias = readl(h + 0x034);
++	}
++	if (g)
++		gdscr = readl(g);
++	pr_err("regpeek %s pll=%08lx phy=%08lx SYSMUX=%08x OUTDIV=%08x STATUS=%08x DEC=%08x FRAC=%08x:%08x:%08x CFG0=%08x CFG1=%08x CTRL0=%08x CTRL3=%08x PLLCNTRL=%08x SPARE4=%08x RBIAS=%08x GDSCR(%08lx)=%08x DYN cmode=%08x ctl=%08x outdiv=%08x dec=%08x frac=%08x\n",
++	       n, pll_phys, phy_phys, sysmux, outdiv, status, lval, calpha,
++	       fracm, frach, cfg0, cfg1, ctrl0, ctrl3, pllctrl, spare4, rbias,
++	       gdsc_phys, gdscr, dcmode, dctl, doutdiv, ddec, dfrac);
++	if (p)
++		iounmap(p);
++	if (h)
++		iounmap(h);
++	if (g)
++		iounmap(g);
++	if (d)
++		iounmap(d);
++}
++
++static void dump_split(void)
++{
++	void __iomem *t = ioremap(SDE_PHYS + 0x1000, 0x400);
++	void __iomem *i1 = ioremap(SDE_PHYS + 0x6b800, 0x300);
++	void __iomem *i2 = ioremap(SDE_PHYS + 0x6c000, 0x300);
++	if (!t) { pr_err("regpeek: split ioremap failed\n"); return; }
++	pr_err("regpeek split SPLIT_EN=%08x UPPER=%08x LOWER=%08x SPARE=%08x\n",
++	       readl(t + 0x2f4), readl(t + 0x2f8), readl(t + 0x3f0),
++	       readl(t + 0x28));
++	iounmap(t);
++	if (i1) {
++		pr_err("regpeek intf1 mux=%08x cfg=%08x cfg2=%08x fcount_en=%08x\n",
++		       readl(i1 + 0x25c), readl(i1 + 0x4), readl(i1 + 0xb8),
++		       readl(i1 + 0xa8));
++		iounmap(i1);
++	}
++	if (i2) {
++		pr_err("regpeek intf2 mux=%08x cfg=%08x cfg2=%08x fcount_en=%08x\n",
++		       readl(i2 + 0x25c), readl(i2 + 0x4), readl(i2 + 0xb8),
++		       readl(i2 + 0xa8));
++		iounmap(i2);
++	}
++}
++
++static void dump_sspp(const char *n, unsigned long phys)
++{
++	void __iomem *b = ioremap(phys, 0x200);
++	if (!b) { pr_err("regpeek: ioremap %s failed\n", n); return; }
++	pr_err("regpeek %s SIZE=%08x SRCXY=%08x OUTSIZE=%08x OUTXY=%08x ADDR0=%08x STRIDE=%08x FMT=%08x OPMODE=%08x MULTI=%08x R1SIZE=%08x R1XY=%08x R1OUT=%08x R1FMT=%08x\n",
++	       n, readl(b + 0x00), readl(b + 0x08), readl(b + 0x0c),
++	       readl(b + 0x10), readl(b + 0x14), readl(b + 0x24),
++	       readl(b + 0x30), readl(b + 0x38), readl(b + 0x170),
++	       readl(b + 0x16c), readl(b + 0x168), readl(b + 0x160),
++	       readl(b + 0x174));
++	iounmap(b);
++}
++
++static const int intf_offs[] = {0x0, 0x4, 0x8, 0x3c, 0x40, 0x64, 0x68};
++static const int pp_offs[] = {0x0, 0x4, 0x8, 0xa0, 0xac, 0xc8};
++static const int lm_offs[] = {0x0, 0x4, 0x8};
++static const int ctl_offs[] = {0x0, 0x4, 0x8, 0x14, 0x18, 0x40, 0x44, 0x70, 0x74, 0x134};
++
++static int __init regpeek_early_init(void)
++{
++	static const char *iname[4] = {"intf0", "intf1", "intf2", "intf3"};
++	static const char *pname[6] = {"pp0", "pp1", "pp2", "pp3", "pp4", "pp5"};
++	static const char *lname[6] = {"lm0", "lm1", "lm2", "lm3", "lm4", "lm5"};
++	static const char *cname[6] = {"ctl0", "ctl1", "ctl2", "ctl3", "ctl4", "ctl5"};
++	int i;
++
++	pr_err("regpeek EARLY t=%llu jiffies=%lu\n",
++	       ktime_get_ns(), jiffies);
++
++	dump_dsi("dsi0", DSI0_PHYS);
++	dump_dsi("dsi1", DSI1_PHYS);
++	dump_phy("phy0", PHY0_PHYS);
++	dump_phy("phy1", PHY1_PHYS);
++	dump_dsc("dsc0", SDE_PHYS + 0x81000);
++	dump_dsc("dsc1", SDE_PHYS + 0x81400);
++	dump_dsc("dsc2", SDE_PHYS + 0x81800);
++	dump_dsc("dsc3", SDE_PHYS + 0x81c00);
++
++	dump_blk("mdp_top", SDE_PHYS, 16);
++	dump_blk("intf0", SDE_PHYS + 0x6b000, 16);
++	dump_blk("intf1", SDE_PHYS + 0x6b800, 16);
++	dump_blk("pp0", SDE_PHYS + 0x71000, 12);
++	dump_blk("pp1", SDE_PHYS + 0x71800, 12);
++
++	for (i = 0; i < 4; i++)
++		dump_idx(iname[i], SDE_PHYS + 0x6b000 + i * 0x800,
++			 intf_offs, 7);
++	for (i = 0; i < 6; i++)
++		dump_idx(pname[i], SDE_PHYS + 0x71000 + i * 0x800,
++			 pp_offs, 6);
++	for (i = 0; i < 6; i++)
++		dump_idx(lname[i], SDE_PHYS + 0x45000 + i * 0x1000,
++			 lm_offs, 3);
++	for (i = 0; i < 6; i++)
++		dump_idx(cname[i], SDE_PHYS + 0x2000 + i * 0x200,
++			 ctl_offs, 10);
++
++	dump_pll("dsi0pll", 0x0ae94900, PHY0_PHYS, 0x0af03000);
++	dump_pll("dsi1pll", 0x0ae96900, PHY1_PHYS, 0x0af03000);
++
++	dump_split();
++	dump_sspp("vig0", SDE_PHYS + 0x5000);
++	dump_sspp("vig1", SDE_PHYS + 0x7000);
++	dump_sspp("vig2", SDE_PHYS + 0x9000);
++	dump_sspp("vig3", SDE_PHYS + 0xb000);
++	dump_sspp("dma0", SDE_PHYS + 0x25000);
++	dump_sspp("dma1", SDE_PHYS + 0x27000);
++
++	pr_err("regpeek EARLY done\n");
++	return 0;
++}
++early_initcall(regpeek_early_init);
++
++MODULE_LICENSE("GPL");
+diff --git a/techpack/display/pll/Makefile b/techpack/display/pll/Makefile
+index 0b29a90ca..639ada023 100644
+--- a/techpack/display/pll/Makefile
++++ b/techpack/display/pll/Makefile
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ 
+-ccflags-y := -I$(srctree)/drivers/clk/qcom/
++ccflags-y := -I$(srctree)/drivers/clk/qcom/ -I$(srctree)/$(src)
+ 
+ obj-$(CONFIG_QCOM_MDSS_PLL) += pll_util.o
+ obj-$(CONFIG_QCOM_MDSS_PLL) += pll_drv.o
+diff --git a/techpack/display/pll/dsi_pll_7nm.c b/techpack/display/pll/dsi_pll_7nm.c
+index 9f49d65a1..fa48757de 100644
+--- a/techpack/display/pll/dsi_pll_7nm.c
++++ b/techpack/display/pll/dsi_pll_7nm.c
+@@ -994,6 +994,10 @@ static int vco_7nm_set_rate(struct clk_hw *hw, unsigned long rate,
+ 		return -EINVAL;
+ 	}
+ 
++	pr_err("TB371FC PLLSETRATE idx=%d rate=%lu pll_on=%d handoff=%d ctrl0=%08x\n",
++	       rsc->index, rate, rsc->pll_on, rsc->handoff_resources,
++	       MDSS_PLL_REG_R(rsc->phy_base, PHY_CMN_CTRL_0));
++
+ 	if (rsc->pll_on)
+ 		return 0;
+ 
+@@ -1406,6 +1410,21 @@ static int dsi_pll_enable(struct dsi_pll_vco_clk *vco)
+ 		rsc->cached_cfg1 |= 0x3;
+ 		if (rsc->slave)
+ 			rsc->slave->cached_cfg1 |= 0x3;
++	} else {
++		/*
++		 * TB371FC bring-up: for DPHY the pixel clock has to come from
++		 * post_bit_div (bitclk/2).  If the cached mux value says
++		 * bitclk_src the DSI pixel timing engine runs at twice the
++		 * requested rate, overrunning the link FIFO.  The cache can go
++		 * stale across dsi_phy_enable()'s PLL/PHY reset, so force the
++		 * post_bit_div selection here.
++		 */
++		rsc->cached_cfg1 = (rsc->cached_cfg1 & ~0x1) | 0x1;
++		if (rsc->slave)
++			rsc->slave->cached_cfg1 =
++				(rsc->slave->cached_cfg1 & ~0x1) | 0x1;
++		pr_err("TB371FC PLLEN force pclk mux post_bit_div cfg1=%08x\n",
++		       rsc->cached_cfg1);
+ 	}
+ 
+ 	phy_reg_update_bits_sub(rsc, PHY_CMN_CLK_CFG1, 0x03, rsc->cached_cfg1);
+@@ -1515,6 +1534,10 @@ static void vco_7nm_unprepare(struct clk_hw *hw)
+ 		return;
+ 	}
+ 
++	pr_err("TB371FC PLLUNPREP enter idx=%d handoff=%d status=%08x\n",
++	       pll->index, pll->handoff_resources,
++	       MDSS_PLL_REG_R(pll->pll_base, PLL_COMMON_STATUS_ONE));
++
+ 	/*
+ 	 * During unprepare in continuous splash use case we want driver
+ 	 * to pick all dividers instead of retaining bootloader configurations.
+@@ -1568,8 +1591,28 @@ static int vco_7nm_prepare(struct clk_hw *hw)
+ 	}
+ 
+ 	/* Skip vco recalculation for continuous splash use case */
+-	if (pll->handoff_resources)
+-		return 0;
++	if (pll->handoff_resources) {
++		/*
++		 * TB371FC bring-up: dsi_phy_enable() fully re-initialises the
++		 * PHY (it asserts PHY_CMN_PLL_CNTRL reset), which stops a PLL
++		 * the bootloader left running.  Only honour the handoff
++		 * shortcut while the PLL is still locked, otherwise fall
++		 * through and start it for real.
++		 */
++		if (!dsi_pll_7nm_lock_status(pll)) {
++			pr_err("TB371FC PLLPREP handoff skip idx=%d\n",
++			       pll->index);
++			return 0;
++		}
++		pr_err("TB371FC PLLPREP handoff but PLL off, enabling idx=%d ctrl0=%08x\n",
++		       pll->index,
++		       MDSS_PLL_REG_R(pll->phy_base, PHY_CMN_CTRL_0));
++		pll->handoff_resources = false;
++	}
++
++	pr_err("TB371FC PLLPREP enter idx=%d cached=%lu rate=%lu ctrl0=%08x\n",
++	       pll->index, pll->vco_cached_rate, clk_hw_get_rate(hw),
++	       MDSS_PLL_REG_R(pll->phy_base, PHY_CMN_CTRL_0));
+ 
+ 	rc = mdss_pll_resource_enable(pll, true);
+ 	if (rc) {
+@@ -1606,6 +1649,11 @@ static int vco_7nm_prepare(struct clk_hw *hw)
+ 		return rc;
+ 	}
+ 
++	pr_err("TB371FC PLLPREP ok idx=%d status=%08x ctrl0=%08x\n",
++	       pll->index,
++	       MDSS_PLL_REG_R(pll->pll_base, PLL_COMMON_STATUS_ONE),
++	       MDSS_PLL_REG_R(pll->phy_base, PHY_CMN_CTRL_0));
++
+ 	return rc;
+ }
+ 
+diff --git a/techpack/stub/stub.c b/techpack/stub/stub.c
+index d69a1b889..413657429 100644
+--- a/techpack/stub/stub.c
++++ b/techpack/stub/stub.c
+@@ -3,3 +3,16 @@
+ static void _techpack_stub(void)
+ {
+ }
++
++#include <linux/device.h>
++#include <linux/types.h>
++
++ssize_t dsi_display_mipi_reg_read(struct device *dev, char *buf)
++{
++	return -ENODEV;
++}
++
++int dsi_display_mipi_reg_write(struct device *dev, const char *buf, size_t count)
++{
++	return -ENODEV;
++}

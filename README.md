@@ -4,7 +4,8 @@
 **Arch Linux ARM aarch64 + KDE Plasma 6 Wayland** 的补丁集合。
 
 > 跑在 **4.19.325** 内核上，来自 [smith-dog/kernel-tb371fc](https://github.com/smith-dog/kernel-tb371fc)
-> （GPL-2.0，基于联想 GPL 源码），构建配置见 [docs/kernel.md](docs/kernel.md)。
+> 的 `2c25a63` 提交（GPL-2.0，基于联想 GPL 源码）加本仓库补丁；
+> 对应源码、补丁和构建配置见 [docs/kernel.md](docs/kernel.md)。
 > 这台机器官方只提供 Android，Linux 侧的坑基本都要自己填。
 >
 > 本仓库只放**补丁、配置、自写源码和踩坑记录**，不含系统镜像。
@@ -105,7 +106,7 @@ scripts/
   flash-linux.sh / flash-windows.bat   刷写脚本（配合自行准备的镜像使用）
 docs/
   kernel.md         内核来源、构建配置、GPL 合规
-  kernel/           从镜像里提取的内核 .config
+  kernel/           内核 .config + 相对上游 2c25a63 的补丁
 NOTICE              第三方组件与许可声明
 ```
 
